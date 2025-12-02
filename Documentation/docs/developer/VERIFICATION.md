@@ -101,6 +101,23 @@ and to write specification and proofs in ghost mode.
   are tightly related to the project code, we may still put them under svsm/kernel with
   `#[verus_verify(rlimit=x)]`
 
+### Run GitHub workflow when submitting changes
+
+When submitting a change, developers should verify their modifications by
+running the [Verification
+workflow](../../../.github/workflows/manual-verify.yml). This can be done by
+triggering the `Verification` workflow for a specific branch under
+[Actions](https://github.com/coconut-svsm/svsm/actions).
+
+At the moment, only admins can manually trigger this workflow within the
+coconut-svsm organization, since verification is still an experimental feature.
+
+Developers can trigger the workflow from their **fork**, as long as both the
+main branch and the target branch in the fork contain the workflow file. Running
+workflow in a fork avoids consuming CI resources from the organization. After
+running the workflow on their fork, developers can include the verification
+results in their pull request.
+
 ### Annotation in Executable Rust
 
 * `#[verus_verify]`: Indicates the item is Verus-aware.
