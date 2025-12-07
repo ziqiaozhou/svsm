@@ -127,9 +127,11 @@ pub open spec fn align_requires(align: InnerAddr) -> bool {
 }
 
 pub open spec fn addr_align_up_requires<A: AddressSpec>(addr: A, align: InnerAddr) -> bool {
+    let iaddr = addr.into_spec();
     &&& align_requires(align)
     &&& 0 < align
-    &&& forall_into(addr, |iaddr: InnerAddr| iaddr + align - 1 <= InnerAddr::MAX)
+    &&& A::obeys_into_spec()
+    &&& iaddr + align - 1 <= InnerAddr::MAX
 }
 
 pub broadcast proof fn lemma_align_up_requires<A: AddressSpec>(
@@ -187,7 +189,8 @@ pub open spec fn is_aligned_spec(val: InnerAddr, align: InnerAddr) -> bool {
 
 #[verifier(inline)]
 pub open spec fn addr_is_aligned_ens<A: AddressSpec>(addr: A, align: InnerAddr, ret: bool) -> bool {
-    exists_into(addr, |inner| is_aligned_spec(inner, align) == ret)
+    let inner = addr.into_spec();
+    A::obeys_into_spec() ==> is_aligned_spec(inner, align) == ret
 }
 
 pub broadcast proof fn lemma_align_up_ens<A: AddressSpec>(addr: A, align: InnerAddr, ret: A)

@@ -57,7 +57,8 @@ impl<T> IsAlignedSpec for T where
 
 verus! {
 
-use verify_external::convert::*;
+use verify_external::convert::FromIntoInteger;
+use vstd::std_specs::convert::{FromSpec, IntoSpec};
 use verify_proof::bits::is_pow_of_2;
 
 #[verifier(inline)]
@@ -111,12 +112,12 @@ pub open spec fn align_down_ens<T>(args: (T, T), ret: T) -> bool where T: AlignD
 
 pub open spec fn align_up_requires<T>(args: (T, T)) -> bool where T: AlignUpSpec {
     let (val, align) = args;
+    let one = T::from_spec(1u8);
+    &&& T::obeys_from_spec()
     &&& align_down_requires(args)
     &&& forall|x: T| x.not_req()
     &&& forall|x: T, y: T| x.bitand_req(y)
-    &&& forall|one: T, mask: T|
-        (call_ensures(T::from, (1u8,), one) && #[trigger] call_ensures(T::sub, (align, one), mask))
-            ==> val.add_req(mask)
+    &&& forall|mask: T| (#[trigger] call_ensures(T::sub, (align, one), mask)) ==> val.add_req(mask)
 }
 
 pub open spec fn align_up_ens<T>(args: (T, T), ret: T) -> bool where T: AlignUpSpec {

@@ -55,7 +55,7 @@ pub trait Address: Copy + From<InnerAddr> + Into<InnerAddr> + Ord {
     #[inline]
     #[verus_spec(ret =>
         ensures
-            exists_into(*self, |i: InnerAddr| ret == (i == 0))
+            Self::obeys_into_spec() ==> ret == ((*self).into_spec() == 0)
     )]
     fn is_null(&self) -> bool {
         self.bits() == 0
@@ -168,7 +168,8 @@ pub trait Address: Copy + From<InnerAddr> + Into<InnerAddr> + Ord {
     #[verus_spec(ret =>
         requires
             size > 0,
-            forall_into(*self, |i: InnerAddr| i + size - 1 <= InnerAddr::MAX),
+            Self::obeys_into_spec(),
+            (*self).into_spec() + size - 1 <= InnerAddr::MAX,
         ensures
             crosses_page_ens(*self, size, ret),
     )]
@@ -182,7 +183,7 @@ pub trait Address: Copy + From<InnerAddr> + Into<InnerAddr> + Ord {
     #[inline]
     #[verus_spec(ret =>
         ensures
-            exists_into(*self, |i: InnerAddr| ret == pfn_spec(i))
+            Self::obeys_into_spec() ==> ret == pfn_spec((*self).into_spec())
     )]
     fn pfn(&self) -> InnerAddr {
         self.bits() >> PAGE_SHIFT

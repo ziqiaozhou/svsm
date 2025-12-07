@@ -7,7 +7,6 @@
 use crate::utils::util::{
     align_down_integer_ens, align_up_integer_ens, proof_align_down, proof_align_up,
 };
-use verify_external::convert::{exists_into, forall_into};
 use verify_external::hw_spec::SpecVAddrImpl;
 use vstd::raw_ptr::{ptr_from_data, ptr_mut_from_data, PtrData};
 use vstd::set_lib::set_int_range;
@@ -104,7 +103,8 @@ pub open spec fn pt_idx_spec(addr: InnerAddr, l: usize) -> usize
 }
 
 pub open spec fn crosses_page_ens<T: Into<InnerAddr>>(addr: T, size: InnerAddr, ret: bool) -> bool {
-    exists_into(addr, |inner| ret == (pfn_spec(inner) != pfn_spec((inner + size - 1) as InnerAddr)))
+    let inner = addr.into_spec();
+    T::obeys_into_spec() ==> (ret == (pfn_spec(inner) != pfn_spec((inner + size - 1) as InnerAddr)))
 }
 
 // Define a view (@) for VirtAddr
@@ -172,8 +172,7 @@ impl VirtAddr {
     }
 
     pub open spec fn new_ensures(self, addr: InnerAddr) -> bool {
-        &&& sign_extend_ensures(addr, self@)
-        &&& VirtAddr::from_spec(addr) == self
+        sign_extend_ensures(addr, self@)
     }
 
     pub open spec fn pgtbl_idx_ensures(&self, l: usize, ret: usize) -> bool {
