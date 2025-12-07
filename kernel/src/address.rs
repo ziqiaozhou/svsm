@@ -228,10 +228,6 @@ impl fmt::LowerHex for PhysAddr {
 
 #[verus_verify]
 impl From<InnerAddr> for PhysAddr {
-    #[verus_spec(
-        returns
-            PhysAddr::from_spec(addr)
-    )]
     #[inline]
     fn from(addr: InnerAddr) -> PhysAddr {
         Self(addr)
@@ -482,7 +478,6 @@ impl From<InnerAddr> for VirtAddr {
     #[verus_spec(ret =>
         ensures
             ret.new_ensures(addr),
-            ret == Self::from_spec(addr),
     )]
     fn from(addr: InnerAddr) -> Self {
         Self(sign_extend(addr))
