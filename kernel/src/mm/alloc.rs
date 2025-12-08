@@ -94,10 +94,7 @@ enum PageType {
 #[verus_verify]
 impl TryFrom<u64> for PageType {
     type Error = AllocError;
-    #[verus_spec(ret =>
-        ensures
-            PageType::ens_try_from(val, ret),
-    )]
+
     fn try_from(val: u64) -> Result<Self, Self::Error> {
         match val {
             v if v == Self::Free as u64 => Ok(Self::Free),

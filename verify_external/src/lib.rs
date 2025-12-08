@@ -14,6 +14,7 @@
 #![no_std]
 #![allow(unused_braces)]
 #![allow(unexpected_cfgs)]
+#![allow(missing_debug_implementations)]
 
 // Add spec for convert traits
 pub mod convert;
