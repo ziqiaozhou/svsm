@@ -491,7 +491,6 @@ impl From<VirtAddr> for InnerAddr {
 #[verus_verify]
 impl From<u64> for VirtAddr {
     #[inline]
-    #[verus_verify(external_body)]
     #[verus_spec(ret =>
         ensures
             ret.new_ensures(addr as usize),

@@ -7,6 +7,7 @@
 use crate::utils::util::{
     align_down_integer_ens, align_up_integer_ens, proof_align_down, proof_align_up,
 };
+use verify_external::convert::TryFromSpec;
 use verify_external::hw_spec::SpecVAddrImpl;
 use vstd::raw_ptr::{ptr_from_data, ptr_mut_from_data, PtrData};
 use vstd::set_lib::set_int_range;
@@ -265,6 +266,16 @@ impl vstd::std_specs::convert::FromSpecImpl<InnerAddr> for VirtAddr {
 
     closed spec fn from_spec(v: InnerAddr) -> Self {
         VirtAddr(sign_extend_spec(v))
+    }
+}
+
+impl vstd::std_specs::convert::FromSpecImpl<u64> for VirtAddr {
+    open spec fn obeys_from_spec() -> bool {
+        true
+    }
+
+    closed spec fn from_spec(v: u64) -> Self {
+        VirtAddr(sign_extend_spec(InnerAddr::try_from_spec(v).unwrap()))
     }
 }
 
