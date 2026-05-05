@@ -72,4 +72,3 @@ for asset in "${VERUS_ASSETS[@]}"; do
     mv "$VERUS_DIR/source/target-verus/release/$asset" ~/.cargo/bin/
 done
 rm -rf "$TMPDIR"
-fi
