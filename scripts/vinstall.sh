@@ -9,14 +9,28 @@ set -e
 trap 'echo "Error at line $LINENO: $BASH_COMMAND"' ERR
 
 # Verus release version and commit hash
+VERUS_VERSION=0.2026.04.12.f1166c4
 VERUS_REV=f1166c42c3decd42c1cca2916ef2880d27cfb7d9
 VERUS_RUST_VERSION=1.94.0
 
 # Verusfmt version and commit hash
+VERUSFMT_VERSION=v0.5.7
 VERUSFMT_REV=beff2fa686d856d5e60df368fd027d94ead11ac5 # v0.5.7
 
 # Z3 version and commit hash
+VERUS_Z3_VERSION=4.12.5
 VERUS_Z3_REV=a7b564cafe3b96c8a868388bc4b96b319facea44
+
+# Parse arguments
+INSTALL_PREBUILT=false
+FORCE_INSTALL=false
+for arg in "$@"; do
+    case "$arg" in
+        --use-prebuilt) INSTALL_PREBUILT=true ;;
+        --force) FORCE_INSTALL=true ;;
+        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
 
 # Install x86_64-unknown-none target for verus-compatible Rust version
 export RUSTUP_TOOLCHAIN=$VERUS_RUST_VERSION
@@ -51,6 +65,39 @@ install_verus_assets() {
 # Skip building Verus from source if the correct version is already installed
 if (verus --version | grep -q "${VERUS_VERSION:0:7}") &> /dev/null && ! $FORCE_INSTALL; then
     echo "Verus version ${VERUS_VERSION:0:7} already installed, skipping build."
+    exit 0
+fi
+
+# Prebuilt path: download binaries and exit early
+install_prebuilt() {
+    ARCH=$(uname -m)
+    OS=$(uname -s)
+    case "$ARCH" in
+        x86_64)        PLATFORM_ARCH="x86" ;;
+        aarch64|arm64) PLATFORM_ARCH="arm64" ;;
+        *) echo "Error: unsupported architecture: $ARCH" >&2; exit 1 ;;
+    esac
+    case "$OS" in
+        Linux)  PLATFORM_OS="linux" ;;
+        Darwin) PLATFORM_OS="macos" ;;
+        *) echo "Error: unsupported OS: $OS" >&2; exit 1 ;;
+    esac
+    PLATFORM="${PLATFORM_ARCH}-${PLATFORM_OS}"
+    ZIPFILE="verus-${VERUS_VERSION}-${PLATFORM}.zip"
+    VERUS_RELEASE_URL="https://github.com/verus-lang/verus/releases/download/release/${VERUS_VERSION}/${ZIPFILE}"
+
+    # Install verusfmt
+    curl --proto '=https' --tlsv1.2 -LsSf https://github.com/verus-lang/verusfmt/releases/download/$VERUSFMT_VERSION/verusfmt-installer.sh | sh
+
+    TMPDIR=$(mktemp -d)
+    curl --proto '=https' --tlsv1.2 -LsSf "$VERUS_RELEASE_URL" -o "$TMPDIR/$ZIPFILE"
+    unzip -q "$TMPDIR/$ZIPFILE" -d "$TMPDIR"
+    install_verus_assets "$TMPDIR/verus-$PLATFORM"
+    rm -rf "$TMPDIR"
+}
+
+if $INSTALL_PREBUILT; then
+    install_prebuilt
     exit 0
 fi
 
