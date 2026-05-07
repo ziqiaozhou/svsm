@@ -13,9 +13,9 @@
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::types::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
 use bitflags::bitflags;
+use core::marker::PhantomData;
 use core::ops::{Index, IndexMut};
 use registers::{CR0Flags, CR4Flags, EFERFlags};
-use zerocopy::FromBytes;
 
 /// Number of entries in a page table (4KB/8B).
 pub const ENTRY_COUNT: usize = 512;
@@ -26,7 +26,7 @@ pub const ENTRY_COUNT: usize = 512;
 /// (e.g., AMD SEV-SNP C-bit) to mark page table entries as private or shared.
 /// Only `private_pte_mask` and `shared_pte_mask` must be implemented;
 /// the remaining methods have default implementations derived from those.
-pub trait PagingArchHandler {
+pub trait PagingArchHandler: 'static {
     // --- Required methods ---
 
     /// Returns the mask to apply for private (encrypted) page table entries.
@@ -184,20 +184,35 @@ impl PagingMode {
     }
 }
 
-/// Represents a page table entry.
+/// Represents a page table entry parameterized by the arch handler.
+///
+/// The arch handler `P` determines how encryption/confidentiality bits
+/// are interpreted, enabling `address()`, `set()`, `page_frame()`, and
+/// `make_private_if_present()` to work correctly without turbofish.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, FromBytes)]
-pub struct PTEntry(pub PhysAddr);
+#[derive(Debug)]
+pub struct PTEntry<P: PagingArchHandler> {
+    entry: PhysAddr,
+    _phantom: PhantomData<fn() -> P>,
+}
 
-impl PTEntry {
+// Manual impls because derive would add bounds on P
+impl<P: PagingArchHandler> Copy for PTEntry<P> {}
+impl<P: PagingArchHandler> Clone for PTEntry<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: PagingArchHandler> PTEntry<P> {
     /// Check if the page table entry is clear (null).
     pub fn is_clear(&self) -> bool {
-        self.0.is_null()
+        self.entry.is_null()
     }
 
     /// Clear the page table entry.
     pub fn clear(&mut self) {
-        self.0 = PhysAddr::null();
+        self.entry = PhysAddr::null();
     }
 
     /// Check if the page table entry is present.
@@ -232,26 +247,49 @@ impl PTEntry {
 
     /// Get the raw bits (`u64`) of the page table entry.
     pub fn raw(&self) -> u64 {
-        self.0.bits() as u64
+        self.entry.bits() as u64
     }
 
     /// Get the flags of the page table entry.
     pub fn flags(&self) -> PTEntryFlags {
-        PTEntryFlags::from_bits_truncate(self.0.bits() as u64)
+        PTEntryFlags::from_bits_truncate(self.entry.bits() as u64)
     }
 
     /// Set the page table entry with the specified address and flags.
-    /// This is the raw set — no flag filtering or encryption handling.
+    /// No flag filtering — the caller is responsible for masking.
     pub fn set_unrestricted(&mut self, addr: PhysAddr, flags: PTEntryFlags) {
         let addr = addr.bits() as u64;
         assert_eq!(addr & !0x000f_ffff_ffff_f000, 0);
-        self.0 = PhysAddr::from(addr | flags.bits());
+        self.entry = PhysAddr::from(addr | flags.bits());
+    }
+
+    /// Set the page table entry with flags filtered through the arch
+    /// handler's feature mask.
+    pub fn set(&mut self, addr: PhysAddr, flags: PTEntryFlags) {
+        self.set_unrestricted(addr, flags & P::feature_mask());
     }
 
     /// Get the raw physical address from the page table entry.
     /// Does NOT strip any encryption/confidentiality bits.
-    pub fn address(&self) -> PhysAddr {
+    pub fn raw_address(&self) -> PhysAddr {
         PhysAddr::from(self.raw() & 0x000f_ffff_ffff_f000)
+    }
+
+    /// Get the address with confidentiality bits stripped (shared bit kept).
+    pub fn page_frame(&self) -> PhysAddr {
+        P::strip_confidentiality_bits(self.raw_address())
+    }
+
+    /// Get the clean address with both confidentiality and shared bits stripped.
+    pub fn address(&self) -> PhysAddr {
+        P::strip_shared_address_bits(self.page_frame())
+    }
+
+    /// Inserts the private address mask if the page is present.
+    pub fn make_private_if_present(&mut self) {
+        if self.flags().contains(PTEntryFlags::PRESENT) {
+            self.entry = P::make_private_address(self.entry);
+        }
     }
 
     /// Read a page table entry from the specified virtual address.
@@ -270,16 +308,19 @@ impl PTEntry {
 
 /// A pagetable page with multiple entries.
 #[repr(C)]
-#[derive(Debug, FromBytes)]
-pub struct PTPage {
-    pub entries: [PTEntry; ENTRY_COUNT],
+#[derive(Debug)]
+pub struct PTPage<P: PagingArchHandler> {
+    pub entries: [PTEntry<P>; ENTRY_COUNT],
 }
 
-impl PTPage {
+impl<P: PagingArchHandler> PTPage<P> {
     /// Converts a pagetable entry to a mutable reference to a [`PTPage`],
     /// if the entry is present and not huge. Uses the provided mapping
     /// to translate the physical address.
-    pub fn from_entry<A: PagingHandler>(entry: PTEntry, mapping: &A) -> Option<&'static mut Self> {
+    pub fn from_entry<A: PagingHandler>(
+        entry: PTEntry<P>,
+        mapping: &A,
+    ) -> Option<&'static mut Self> {
         let flags = entry.flags();
         if !flags.contains(PTEntryFlags::PRESENT) || flags.contains(PTEntryFlags::HUGE) {
             return None;
@@ -298,33 +339,33 @@ impl PTPage {
     /// The caller must ensure that the virtual address is a valid page table.
     pub unsafe fn from_vaddr(vaddr: VirtAddr) -> &'static mut Self {
         // SAFETY: the caller guarantees the correctness of the virtual address.
-        unsafe { &mut *vaddr.as_mut_ptr::<PTPage>() }
+        unsafe { &mut *vaddr.as_mut_ptr::<Self>() }
     }
 }
 
 /// Can be used to access page table entries by index.
-impl Index<usize> for PTPage {
-    type Output = PTEntry;
+impl<P: PagingArchHandler> Index<usize> for PTPage<P> {
+    type Output = PTEntry<P>;
 
-    fn index(&self, index: usize) -> &PTEntry {
+    fn index(&self, index: usize) -> &PTEntry<P> {
         &self.entries[index]
     }
 }
 
 /// Can be used to modify page table entries by index.
-impl IndexMut<usize> for PTPage {
-    fn index_mut(&mut self, index: usize) -> &mut PTEntry {
+impl<P: PagingArchHandler> IndexMut<usize> for PTPage<P> {
+    fn index_mut(&mut self, index: usize) -> &mut PTEntry<P> {
         &mut self.entries[index]
     }
 }
 
 /// Mapping levels of page table entries.
 #[derive(Debug)]
-pub enum Mapping<'a> {
-    Level3(&'a mut PTEntry),
-    Level2(&'a mut PTEntry),
-    Level1(&'a mut PTEntry),
-    Level0(&'a mut PTEntry),
+pub enum Mapping<'a, P: PagingArchHandler> {
+    Level3(&'a mut PTEntry<P>),
+    Level2(&'a mut PTEntry<P>),
+    Level1(&'a mut PTEntry<P>),
+    Level0(&'a mut PTEntry<P>),
 }
 
 /// A physical address within a page frame.
@@ -368,7 +409,7 @@ impl PageFrame {
 #[repr(C)]
 #[derive(Debug)]
 pub struct PageTable<P: PagingHandler> {
-    root: PTPage,
+    root: PTPage<P>,
     provider: P,
 }
 
@@ -377,19 +418,22 @@ impl<P: PagingHandler> PageTable<P> {
     pub fn new(provider: P) -> Self {
         Self {
             root: PTPage {
-                entries: [PTEntry(PhysAddr::null()); ENTRY_COUNT],
+                entries: [PTEntry {
+                    entry: PhysAddr::null(),
+                    _phantom: PhantomData,
+                }; ENTRY_COUNT],
             },
             provider,
         }
     }
 
     /// Get a reference to the root page.
-    pub fn root(&self) -> &PTPage {
+    pub fn root(&self) -> &PTPage<P> {
         &self.root
     }
 
     /// Get a mutable reference to the root page.
-    pub fn root_mut(&mut self) -> &mut PTPage {
+    pub fn root_mut(&mut self) -> &mut PTPage<P> {
         &mut self.root
     }
 
@@ -415,12 +459,16 @@ impl<P: PagingHandler> PageTable<P> {
     }
 
     /// Walk the virtual address and return the corresponding mapping.
-    pub fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
+    pub fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_, P> {
         Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr)
     }
 
     /// Walks the page table at level 3.
-    pub fn walk_addr_lvl3<'a>(page: &'a mut PTPage, provider: &P, vaddr: VirtAddr) -> Mapping<'a> {
+    pub fn walk_addr_lvl3<'a>(
+        page: &'a mut PTPage<P>,
+        provider: &P,
+        vaddr: VirtAddr,
+    ) -> Mapping<'a, P> {
         let idx = Self::index::<3>(vaddr);
         let entry = page[idx];
         match PTPage::from_entry(entry, provider) {
@@ -430,7 +478,11 @@ impl<P: PagingHandler> PageTable<P> {
     }
 
     /// Walks the page table at level 2.
-    pub fn walk_addr_lvl2<'a>(page: &'a mut PTPage, provider: &P, vaddr: VirtAddr) -> Mapping<'a> {
+    pub fn walk_addr_lvl2<'a>(
+        page: &'a mut PTPage<P>,
+        provider: &P,
+        vaddr: VirtAddr,
+    ) -> Mapping<'a, P> {
         let idx = Self::index::<2>(vaddr);
         let entry = page[idx];
         match PTPage::from_entry(entry, provider) {
@@ -440,7 +492,11 @@ impl<P: PagingHandler> PageTable<P> {
     }
 
     /// Walks the page table at level 1.
-    pub fn walk_addr_lvl1<'a>(page: &'a mut PTPage, provider: &P, vaddr: VirtAddr) -> Mapping<'a> {
+    pub fn walk_addr_lvl1<'a>(
+        page: &'a mut PTPage<P>,
+        provider: &P,
+        vaddr: VirtAddr,
+    ) -> Mapping<'a, P> {
         let idx = Self::index::<1>(vaddr);
         let entry = page[idx];
         match PTPage::from_entry(entry, provider) {
@@ -450,13 +506,13 @@ impl<P: PagingHandler> PageTable<P> {
     }
 
     /// Walks the page table at level 0.
-    pub fn walk_addr_lvl0(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
+    pub fn walk_addr_lvl0(page: &mut PTPage<P>, vaddr: VirtAddr) -> Mapping<'_, P> {
         let idx = Self::index::<0>(vaddr);
         Mapping::Level0(&mut page[idx])
     }
 
     /// Allocates page table levels down to a 4KB PTE.
-    pub fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
+    pub fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_, P> {
         let m = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr);
 
         match m {
@@ -474,7 +530,7 @@ impl<P: PagingHandler> PageTable<P> {
     }
 
     /// Allocates page table levels down to a 2MB PTE.
-    pub fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
+    pub fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_, P> {
         let m = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr);
 
         match m {
@@ -491,11 +547,11 @@ impl<P: PagingHandler> PageTable<P> {
 
     /// Allocate at level 3, descend to level 2.
     pub fn alloc_pte_lvl3<'a>(
-        entry: &'a mut PTEntry,
+        entry: &'a mut PTEntry<P>,
         vaddr: VirtAddr,
         size: PageSize,
         provider: &mut P,
-    ) -> Mapping<'a> {
+    ) -> Mapping<'a, P> {
         let flags = entry.flags();
 
         if flags.contains(PTEntryFlags::PRESENT) {
@@ -522,11 +578,11 @@ impl<P: PagingHandler> PageTable<P> {
 
     /// Allocate at level 2, descend to level 1.
     pub fn alloc_pte_lvl2<'a>(
-        entry: &'a mut PTEntry,
+        entry: &'a mut PTEntry<P>,
         vaddr: VirtAddr,
         size: PageSize,
         provider: &mut P,
-    ) -> Mapping<'a> {
+    ) -> Mapping<'a, P> {
         let flags = entry.flags();
 
         if flags.contains(PTEntryFlags::PRESENT) {
@@ -553,11 +609,11 @@ impl<P: PagingHandler> PageTable<P> {
 
     /// Allocate at level 1, descend to level 0.
     pub fn alloc_pte_lvl1<'a>(
-        entry: &'a mut PTEntry,
+        entry: &'a mut PTEntry<P>,
         vaddr: VirtAddr,
         size: PageSize,
         provider: &mut P,
-    ) -> Mapping<'a> {
+    ) -> Mapping<'a, P> {
         let flags = entry.flags();
 
         if size == PageSize::Huge || flags.contains(PTEntryFlags::PRESENT) {
@@ -728,11 +784,11 @@ impl<P: PagingHandler> PageTable<P> {
 /// Methods requiring TLB flush support (splitting, encryption changes).
 impl<P: PagingHandler> PageTable<P> {
     /// Splits a 2MB page into 4KB pages.
-    fn do_split_4k(provider: &mut P, entry: &mut PTEntry) -> Result<(), P::Error> {
+    fn do_split_4k(provider: &mut P, entry: &mut PTEntry<P>) -> Result<(), P::Error> {
         let paddr = provider.allocate_frame()?;
         let vaddr_page = provider.paddr_to_vaddr(paddr);
         // SAFETY: We just allocated a zeroed frame at this address.
-        let page = unsafe { PTPage::from_vaddr(vaddr_page) };
+        let page: &mut PTPage<P> = unsafe { PTPage::from_vaddr(vaddr_page) };
 
         let mut flags = entry.flags();
         assert!(flags.contains(PTEntryFlags::HUGE));
@@ -757,14 +813,14 @@ impl<P: PagingHandler> PageTable<P> {
     }
 
     /// Sets the shared encryption state on a PTE.
-    fn make_pte_shared(entry: &mut PTEntry) {
+    fn make_pte_shared(entry: &mut PTEntry<P>) {
         let flags = entry.flags();
         let addr = entry.address();
         entry.set_unrestricted(P::make_shared_address(addr), flags);
     }
 
     /// Sets the private encryption state on a PTE.
-    fn make_pte_private(entry: &mut PTEntry) {
+    fn make_pte_private(entry: &mut PTEntry<P>) {
         let flags = entry.flags();
         let addr = entry.address();
         entry.set_unrestricted(P::make_private_address(addr), flags);
@@ -828,14 +884,14 @@ impl<P: PagingHandler + SelfMap> PageTable<P> {
 
         // SAFETY: Reading PTE hierarchy top-down through self-map addresses.
         // Each level is checked for presence before reading the next.
-        let pml4e = unsafe { PTEntry::read_pte(pml4e_addr) };
+        let pml4e: PTEntry<P> = unsafe { PTEntry::read_pte(pml4e_addr) };
         if !pml4e.present() {
             return None;
         }
 
         // SAFETY: The PML4E was checked to be present, so the PDPE exists
         // and can be read safely via the self-map.
-        let pdpe = unsafe { PTEntry::read_pte(pdpe_addr) };
+        let pdpe: PTEntry<P> = unsafe { PTEntry::read_pte(pdpe_addr) };
         if !pdpe.present() {
             return None;
         }
@@ -847,7 +903,7 @@ impl<P: PagingHandler + SelfMap> PageTable<P> {
 
         // SAFETY: The PDPE was checked to be present and not huge,
         // so the PDE exists and can be read safely via the self-map.
-        let pde = unsafe { PTEntry::read_pte(pde_addr) };
+        let pde: PTEntry<P> = unsafe { PTEntry::read_pte(pde_addr) };
         if !pde.present() {
             return None;
         }
@@ -859,7 +915,7 @@ impl<P: PagingHandler + SelfMap> PageTable<P> {
 
         // SAFETY: The PDE was checked to be present and not huge,
         // so the PTE exists and can be read safely via the self-map.
-        let pte = unsafe { PTEntry::read_pte(pte_addr) };
+        let pte: PTEntry<P> = unsafe { PTEntry::read_pte(pte_addr) };
         if pte.present() {
             let pa = P::strip_confidentiality_bits(pte.address()) + (usize::from(vaddr) & 0xFFF);
             Some(PageFrame::Size4K(pa))
