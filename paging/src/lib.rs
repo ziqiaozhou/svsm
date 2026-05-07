@@ -16,7 +16,7 @@ pub mod util;
 
 pub use address::{Address, PhysAddr, VirtAddr};
 pub use pagetable::{
-    ENTRY_COUNT, Mapping, PTEntry, PTEntryFlags, PTPage, PageFrame, PageTable, PageTableOps,
+    ENTRY_COUNT, Mapping, PTEntry, PTEntryFlags, PTPage, PageFrame, PageTable, PagingArchHandler,
     PagingHandler, PagingMode, SelfMap,
 };
 pub use types::{

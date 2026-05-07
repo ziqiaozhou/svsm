@@ -20,30 +20,13 @@ use zerocopy::FromBytes;
 /// Number of entries in a page table (4KB/8B).
 pub const ENTRY_COUNT: usize = 512;
 
-/// Combined trait for page table provider capabilities:
-/// physical-to-virtual mapping, frame allocation, and encryption mask handling.
+/// Architecture-dependent page encryption/confidentiality handling.
 ///
-/// # Safety
-///
-/// Implementer must guarantee that:
-/// - `paddr_to_vaddr` returns a virtual address that validly maps the given physical address.
-/// - `allocate_frame` returns unique, zeroed frames suitable as page table pages.
-pub unsafe trait PagingHandler {
-    type Error;
-
-    /// Translate a physical address to a virtual address.
-    fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr;
-
-    /// Allocate a zeroed page-table frame, returning its physical address.
-    fn allocate_frame(&mut self) -> Result<PhysAddr, Self::Error>;
-
-    /// Deallocate a previously allocated page-table frame.
-    ///
-    /// # Safety
-    ///
-    /// `paddr` must have been returned by `allocate_frame` and not yet freed.
-    unsafe fn deallocate_frame(&mut self, paddr: PhysAddr);
-
+/// Provides the encryption masks used by confidential computing platforms
+/// (e.g., AMD SEV-SNP C-bit) to mark page table entries as private or shared.
+/// Only `private_pte_mask` and `shared_pte_mask` must be implemented;
+/// the remaining methods have default implementations derived from those.
+pub trait PagingArchHandler {
     /// Returns the mask to apply for private (encrypted) page table entries.
     fn private_pte_mask() -> usize;
 
@@ -76,6 +59,38 @@ pub unsafe trait PagingHandler {
     fn is_shared_address(paddr: PhysAddr) -> bool {
         paddr == Self::make_shared_address(paddr)
     }
+
+    /// Flush the TLB globally and synchronize across all CPUs.
+    ///
+    /// Required for page table operations that modify existing mappings
+    /// (e.g., splitting huge pages) where stale TLB entries could cause
+    /// correctness issues.
+    fn flush_tlb_global();
+}
+
+/// OS-dependent page table provider: physical-to-virtual mapping and
+/// frame allocation/deallocation.
+///
+/// # Safety
+///
+/// Implementer must guarantee that:
+/// - `paddr_to_vaddr` returns a virtual address that validly maps the given physical address.
+/// - `allocate_frame` returns unique, zeroed frames suitable as page table pages.
+pub unsafe trait PagingHandler: PagingArchHandler {
+    type Error;
+
+    /// Translate a physical address to a virtual address.
+    fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr;
+
+    /// Allocate a zeroed page-table frame, returning its physical address.
+    fn allocate_frame(&mut self) -> Result<PhysAddr, Self::Error>;
+
+    /// Deallocate a previously allocated page-table frame.
+    ///
+    /// # Safety
+    ///
+    /// `paddr` must have been returned by `allocate_frame` and not yet freed.
+    unsafe fn deallocate_frame(&mut self, paddr: PhysAddr);
 }
 
 /// Trait for providers that support self-mapped page tables.
@@ -87,16 +102,6 @@ pub unsafe trait PagingHandler {
 pub trait SelfMap {
     /// Returns the virtual base address of the PTE self-map region.
     fn pte_base() -> VirtAddr;
-}
-
-/// Trait for providers that support TLB flush operations.
-///
-/// Required for page table operations that modify existing mappings
-/// (e.g., splitting huge pages) where stale TLB entries could cause
-/// correctness issues.
-pub trait PageTableOps: PagingHandler {
-    /// Flush the TLB globally and synchronize across all CPUs.
-    fn flush_tlb_global();
 }
 
 bitflags! {
@@ -725,7 +730,7 @@ impl<P: PagingHandler> PageTable<P> {
 }
 
 /// Methods requiring TLB flush support (splitting, encryption changes).
-impl<P: PageTableOps> PageTable<P> {
+impl<P: PagingHandler> PageTable<P> {
     /// Splits a 2MB page into 4KB pages.
     fn do_split_4k(provider: &mut P, entry: &mut PTEntry) -> Result<(), P::Error> {
         let paddr = provider.allocate_frame()?;

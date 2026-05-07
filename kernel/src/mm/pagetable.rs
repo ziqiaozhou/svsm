@@ -29,7 +29,7 @@ use zerocopy::FromZeros;
 
 // Re-export types from the paging crate.
 pub use paging::pagetable::{
-    ENTRY_COUNT, PTEntryFlags, PageFrame, PageTableOps, PagingHandler, PagingMode, SelfMap,
+    ENTRY_COUNT, PTEntryFlags, PageFrame, PagingArchHandler, PagingHandler, PagingMode, SelfMap,
 };
 
 /// Mask for private page table entry.
@@ -1192,6 +1192,20 @@ impl PageTable {
 #[derive(Debug, Clone, Copy)]
 pub struct SvsmPTProvider;
 
+impl PagingArchHandler for SvsmPTProvider {
+    fn private_pte_mask() -> usize {
+        private_pte_mask()
+    }
+
+    fn shared_pte_mask() -> usize {
+        shared_pte_mask()
+    }
+
+    fn flush_tlb_global() {
+        flush_tlb_global_sync();
+    }
+}
+
 // SAFETY: paddr_to_vaddr correctly maps physical addresses via phys_to_virt,
 // and allocate_frame returns unique zeroed frames via PageBox.
 unsafe impl PagingHandler for SvsmPTProvider {
@@ -1217,25 +1231,11 @@ unsafe impl PagingHandler for SvsmPTProvider {
             let _ = PageBox::from_raw(ptr);
         }
     }
-
-    fn private_pte_mask() -> usize {
-        private_pte_mask()
-    }
-
-    fn shared_pte_mask() -> usize {
-        shared_pte_mask()
-    }
 }
 
 impl SelfMap for SvsmPTProvider {
     fn pte_base() -> VirtAddr {
         SVSM_PTE_BASE
-    }
-}
-
-impl PageTableOps for SvsmPTProvider {
-    fn flush_tlb_global() {
-        flush_tlb_global_sync();
     }
 }
 
