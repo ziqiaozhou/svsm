@@ -12,7 +12,6 @@
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::types::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
-use crate::util::bit_mask;
 use bitflags::bitflags;
 use core::ops::{Index, IndexMut};
 use registers::{CR0Flags, CR4Flags, EFERFlags};
@@ -281,19 +280,6 @@ impl PTEntry {
         PhysAddr::from(self.raw() & 0x000f_ffff_ffff_f000)
     }
 
-    /// Get the address from the page table entry, stripping private
-    /// encryption bits. The result still includes shared bits.
-    pub fn page_frame<E: PageEncryptionMasks>(&self) -> PhysAddr {
-        let addr = PhysAddr::from(self.0.bits() & 0x000f_ffff_ffff_f000);
-        E::strip_confidentiality_bits(addr)
-    }
-
-    /// Get the address from the page table entry, stripping both
-    /// private and shared bits.
-    pub fn clean_address<E: PageEncryptionMasks>(&self) -> PhysAddr {
-        E::strip_shared_address_bits(self.page_frame::<E>())
-    }
-
     /// Set the page table entry with the specified address and flags,
     /// filtering flags through the given feature mask.
     pub fn set_with_feature_mask(
@@ -303,97 +289,6 @@ impl PTEntry {
         feature_mask: PTEntryFlags,
     ) {
         self.set(addr, flags & feature_mask);
-    }
-
-    /// Check if the page table entry has reserved bits set.
-    pub fn has_reserved_bits<E: PageEncryptionMasks>(
-        &self,
-        pm: PagingMode,
-        level: usize,
-        phys_addr_size: u32,
-    ) -> bool {
-        let reserved_mask = match pm {
-            PagingMode::NoPaging => unreachable!("NoPaging does not have page table"),
-            PagingMode::NonPAE => {
-                match level {
-                    // No reserved bits in 4k PTE.
-                    0 => 0,
-                    1 => {
-                        if self.huge() {
-                            // Bit21 is reserved in 4M PDE.
-                            bit_mask(21, 21)
-                        } else {
-                            0
-                        }
-                    }
-                    _ => unreachable!("Invalid NonPAE page table level"),
-                }
-            }
-            PagingMode::PAE => {
-                // Bit62 ~ MAXPHYSADDR are reserved for each
-                // level in PAE page table.
-                bit_mask(62, phys_addr_size)
-                    | match level {
-                        0 => 0,
-                        1 => {
-                            if self.huge() {
-                                // Bit20 ~ Bit13 are reserved in 2M PDE.
-                                bit_mask(20, 13)
-                            } else {
-                                0
-                            }
-                        }
-                        // Bit63 and Bit8 ~ Bit5 are reserved in PDPTE.
-                        2 => bit_mask(63, 63) | bit_mask(8, 5),
-                        _ => unreachable!("Invalid PAE page table level"),
-                    }
-            }
-            PagingMode::PML4 | PagingMode::PML5 => {
-                // Bit51 ~ MAXPHYSADDR are reserved for each level
-                // in PML4 and PML5 page table.
-                let common = if phys_addr_size > 51 {
-                    0
-                } else {
-                    // Remove the encryption mask bit as this bit is not reserved
-                    bit_mask(51, phys_addr_size)
-                        & !((E::shared_pte_mask() | E::private_pte_mask()) as u64)
-                };
-
-                common
-                    | match level {
-                        0 => 0,
-                        1 => {
-                            if self.huge() {
-                                // Bit20 ~ Bit13 are reserved in 2M PDE.
-                                bit_mask(20, 13)
-                            } else {
-                                0
-                            }
-                        }
-                        2 => {
-                            if self.huge() {
-                                // Bit29 ~ Bit13 are reserved in 1G PDPTE.
-                                bit_mask(29, 13)
-                            } else {
-                                0
-                            }
-                        }
-                        // Bit8 ~ Bit7 are reserved in PML4E.
-                        3 => bit_mask(8, 7),
-                        4 => {
-                            if pm == PagingMode::PML4 {
-                                unreachable!("Invalid PML4 page table level");
-                            } else {
-                                // Bit8 ~ Bit7 are reserved in PML5E.
-                                bit_mask(8, 7)
-                            }
-                        }
-                        _ => unreachable!("Invalid PML4/PML5 page table level"),
-                    }
-            }
-        };
-
-        self.raw() & reserved_mask != 0
     }
 
     /// Read a page table entry from the specified virtual address.
@@ -882,7 +777,7 @@ impl<P: PageTableOps> PageTable<P> {
         let mut flags = entry.flags();
         assert!(flags.contains(PTEntryFlags::HUGE));
 
-        let addr_2m = entry.clean_address::<P>();
+        let addr_2m = P::strip_shared_address_bits(P::strip_confidentiality_bits(entry.address()));
         let addr_2m = PhysAddr::from(addr_2m.bits() & 0x000f_ffff_fff0_0000);
 
         flags.remove(PTEntryFlags::HUGE);
