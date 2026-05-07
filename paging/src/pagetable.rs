@@ -839,8 +839,7 @@ impl<P: PagingHandler> GenericPageTable<P> {
         let mut flags = entry.flags();
         assert!(flags.contains(PTEntryFlags::HUGE));
 
-        let addr_2m = P::strip_shared_address_bits(P::strip_confidentiality_bits(entry.address()));
-        let addr_2m = PhysAddr::from(addr_2m.bits() & 0x000f_ffff_fff0_0000);
+        let addr_2m = PhysAddr::from(entry.address().bits() & 0x000f_ffff_fff0_0000);
 
         flags.remove(PTEntryFlags::HUGE);
 
@@ -942,8 +941,7 @@ impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
             return None;
         }
         if pdpe.huge() {
-            let pa =
-                P::strip_confidentiality_bits(pdpe.address()) + (usize::from(vaddr) & 0x3FFF_FFFF);
+            let pa = pdpe.page_frame() + (usize::from(vaddr) & 0x3FFF_FFFF);
             return Some(PageFrame::Size1G(pa));
         }
 
@@ -954,8 +952,7 @@ impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
             return None;
         }
         if pde.huge() {
-            let pa =
-                P::strip_confidentiality_bits(pde.address()) + (usize::from(vaddr) & 0x001F_FFFF);
+            let pa = pde.page_frame() + (usize::from(vaddr) & 0x001F_FFFF);
             return Some(PageFrame::Size2M(pa));
         }
 
@@ -963,7 +960,7 @@ impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
         // so the PTE exists and can be read safely via the self-map.
         let pte: PTEntry<P> = unsafe { PTEntry::read_pte(pte_addr) };
         if pte.present() {
-            let pa = P::strip_confidentiality_bits(pte.address()) + (usize::from(vaddr) & 0xFFF);
+            let pa = pte.page_frame() + (usize::from(vaddr) & 0xFFF);
             Some(PageFrame::Size4K(pa))
         } else {
             None
