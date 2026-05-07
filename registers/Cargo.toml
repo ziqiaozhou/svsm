@@ -1,0 +1,9 @@
+[package]
+name = "registers"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "x86_64 CPU register flag definitions"
+
+[dependencies]
+bitflags = "2.4"

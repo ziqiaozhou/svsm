@@ -67,6 +67,7 @@ vstd = { workspace = true, optional = true}
 verify_proof = { workspace = true, optional = true}
 verify_external = { workspace = true, optional = true}
 verus_stub = { workspace = true }
+registers = { workspace = true }
 
 [target."x86_64-unknown-none".dev-dependencies]
 test.workspace = true

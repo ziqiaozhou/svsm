@@ -9,6 +9,7 @@ members = [
     "boot/bootimg",
     "boot/defs",
     "cpuarch",
+    "registers",
     # binary targets
     "stage1",
     "kernel",
@@ -53,6 +54,7 @@ edition = "2024"
 bootdefs = { path = "boot/defs" }
 bootimg = { path = "boot/bootimg" }
 cpuarch = { path = "cpuarch" }
+registers = { path = "registers" }
 test = { path = "test" }
 svsm = { path = "kernel" }
 elf = { path = "elf" }
