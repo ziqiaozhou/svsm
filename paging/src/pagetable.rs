@@ -22,12 +22,14 @@ use zerocopy::{FromBytes, FromZeros, Maybe, TryFromBytes};
 pub const ENTRY_COUNT: usize = 512;
 
 /// Architecture-dependent page encryption/confidentiality handling.
+/// Architecture-dependent page encryption/confidentiality handling.
 ///
-/// Provides the encryption masks used by confidential computing platforms
-/// (e.g., AMD SEV-SNP C-bit) to mark page table entries as private or shared.
-/// Only `private_pte_mask` and `shared_pte_mask` must be implemented;
-/// the remaining methods have default implementations derived from those.
-pub trait PagingArchHandler: 'static {
+/// Provides encryption masks, address manipulation, TLB flush, and feature
+/// mask support for confidential computing platforms (e.g., AMD SEV-SNP C-bit).
+/// Only `private_pte_mask`, `shared_pte_mask`, and `flush_tlb_global` must be
+/// implemented; the remaining methods have default implementations derived
+/// from those.
+pub trait ArchPagingMeta: 'static {
     // --- Required methods ---
 
     /// Returns the mask to apply for private (encrypted) page table entries.
@@ -84,21 +86,22 @@ pub trait PagingArchHandler: 'static {
 /// Implementer must guarantee that:
 /// - `paddr_to_vaddr` returns a virtual address that validly maps the given physical address.
 /// - `allocate_frame` returns unique, zeroed frames suitable as page table pages.
-pub unsafe trait PagingHandler: PagingArchHandler {
+pub unsafe trait PagingHandler: 'static {
     type Error;
 
-    /// Translate a physical address to a virtual address.
-    fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr;
+    /// Translate a physical address to a virtual address for accessing
+    /// page table pages.
+    fn paddr_to_vaddr(paddr: PhysAddr) -> VirtAddr;
 
     /// Allocate a zeroed page-table frame, returning its physical address.
-    fn allocate_frame(&mut self) -> Result<PhysAddr, Self::Error>;
+    fn allocate_frame() -> Result<PhysAddr, Self::Error>;
 
     /// Deallocate a previously allocated page-table frame.
     ///
     /// # Safety
     ///
     /// `paddr` must have been returned by `allocate_frame` and not yet freed.
-    unsafe fn deallocate_frame(&mut self, paddr: PhysAddr);
+    unsafe fn deallocate_frame(paddr: PhysAddr);
 }
 
 /// Trait for providers that support self-mapped page tables.
@@ -185,21 +188,21 @@ impl PagingMode {
     }
 }
 
-/// Represents a page table entry parameterized by the arch handler.
+/// Represents a page table entry parameterized by the architecture metadata.
 ///
-/// The arch handler `P` determines how encryption/confidentiality bits
-/// are interpreted, enabling `address()`, `set()`, `page_frame()`, and
+/// The `ArchPagingMeta` impl `P` determines how encryption/confidentiality
+/// bits are interpreted, enabling `address()`, `set()`, `page_frame()`, and
 /// `make_private_if_present()` to work correctly without turbofish.
 #[repr(C)]
 #[derive(Debug)]
-pub struct PTEntry<P: PagingArchHandler> {
+pub struct PTEntry<P: ArchPagingMeta> {
     entry: PhysAddr,
     _phantom: PhantomData<fn() -> P>,
 }
 
 // Manual impls because derive would add bounds on P
-impl<P: PagingArchHandler> Copy for PTEntry<P> {}
-impl<P: PagingArchHandler> Clone for PTEntry<P> {
+impl<P: ArchPagingMeta> Copy for PTEntry<P> {}
+impl<P: ArchPagingMeta> Clone for PTEntry<P> {
     fn clone(&self) -> Self {
         *self
     }
@@ -208,7 +211,7 @@ impl<P: PagingArchHandler> Clone for PTEntry<P> {
 // SAFETY: `PTEntry<P>` is a repr(C) wrapper around `PhysAddr` plus zero-sized
 // `PhantomData`, so every initialized byte pattern valid for `PhysAddr` is also
 // valid for `PTEntry<P>`, independent of `P`.
-unsafe impl<P: PagingArchHandler> TryFromBytes for PTEntry<P> {
+unsafe impl<P: ArchPagingMeta> TryFromBytes for PTEntry<P> {
     fn is_bit_valid<A: zerocopy::pointer::invariant::Reference>(
         _candidate: Maybe<'_, Self, A>,
     ) -> bool {
@@ -219,16 +222,16 @@ unsafe impl<P: PagingArchHandler> TryFromBytes for PTEntry<P> {
 }
 
 // SAFETY: Zero is a valid value for `PhysAddr`, and `PhantomData` is zero-sized.
-unsafe impl<P: PagingArchHandler> FromZeros for PTEntry<P> {
+unsafe impl<P: ArchPagingMeta> FromZeros for PTEntry<P> {
     fn only_derive_is_allowed_to_implement_this_trait() {}
 }
 
 // SAFETY: `PTEntry<P>` has no invalid bit patterns beyond those of `PhysAddr`.
-unsafe impl<P: PagingArchHandler> FromBytes for PTEntry<P> {
+unsafe impl<P: ArchPagingMeta> FromBytes for PTEntry<P> {
     fn only_derive_is_allowed_to_implement_this_trait() {}
 }
 
-impl<P: PagingArchHandler> PTEntry<P> {
+impl<P: ArchPagingMeta> PTEntry<P> {
     /// Check if the page table entry is clear (null).
     pub fn is_clear(&self) -> bool {
         self.entry.is_null()
@@ -333,15 +336,17 @@ impl<P: PagingArchHandler> PTEntry<P> {
 /// A pagetable page with multiple entries.
 #[repr(C)]
 #[derive(Debug)]
-pub struct PTPage<P: PagingArchHandler> {
-    pub entries: [PTEntry<P>; ENTRY_COUNT],
+pub struct PTPage<A: ArchPagingMeta, P: PagingHandler> {
+    pub entries: [PTEntry<A>; ENTRY_COUNT],
+    _phantom: PhantomData<fn() -> P>,
 }
 
-// SAFETY: `PTPage<P>` is a repr(C) array of `PTEntry<P>` values, and arrays of
-// `FromBytes` elements are valid for any initialized byte sequence.
-unsafe impl<P: PagingArchHandler> TryFromBytes for PTPage<P> {
-    fn is_bit_valid<A: zerocopy::pointer::invariant::Reference>(
-        _candidate: Maybe<'_, Self, A>,
+// SAFETY: `PTPage<A, P>` is a repr(C) array of `PTEntry<A>` values plus
+// zero-sized PhantomData, and arrays of `FromBytes` elements are valid for
+// any initialized byte sequence.
+unsafe impl<A: ArchPagingMeta, P: PagingHandler> TryFromBytes for PTPage<A, P> {
+    fn is_bit_valid<R: zerocopy::pointer::invariant::Reference>(
+        _candidate: Maybe<'_, Self, R>,
     ) -> bool {
         true
     }
@@ -349,30 +354,27 @@ unsafe impl<P: PagingArchHandler> TryFromBytes for PTPage<P> {
     fn only_derive_is_allowed_to_implement_this_trait() {}
 }
 
-// SAFETY: Zero-initializing each `PTEntry<P>` yields a valid zeroed PT page.
-unsafe impl<P: PagingArchHandler> FromZeros for PTPage<P> {
+// SAFETY: Zero-initializing each `PTEntry<A>` yields a valid zeroed PT page.
+unsafe impl<A: ArchPagingMeta, P: PagingHandler> FromZeros for PTPage<A, P> {
     fn only_derive_is_allowed_to_implement_this_trait() {}
 }
 
-// SAFETY: `PTPage<P>` contains only `PTEntry<P>` elements.
-unsafe impl<P: PagingArchHandler> FromBytes for PTPage<P> {
+// SAFETY: `PTPage<A, P>` contains only `PTEntry<A>` elements and zero-sized PhantomData.
+unsafe impl<A: ArchPagingMeta, P: PagingHandler> FromBytes for PTPage<A, P> {
     fn only_derive_is_allowed_to_implement_this_trait() {}
 }
 
-impl<P: PagingArchHandler> PTPage<P> {
+impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
     /// Converts a pagetable entry to a mutable reference to a [`PTPage`],
-    /// if the entry is present and not huge. Uses the provided mapping
+    /// if the entry is present and not huge. Uses `P::paddr_to_vaddr`
     /// to translate the physical address.
-    pub fn from_entry<A: PagingHandler>(
-        entry: PTEntry<P>,
-        mapping: &A,
-    ) -> Option<&'static mut Self> {
+    pub fn from_entry(entry: PTEntry<A>) -> Option<&'static mut Self> {
         let flags = entry.flags();
         if !flags.contains(PTEntryFlags::PRESENT) || flags.contains(PTEntryFlags::HUGE) {
             return None;
         }
 
-        let address = mapping.paddr_to_vaddr(entry.address());
+        let address = P::paddr_to_vaddr(entry.address());
         // SAFETY: Every PTEntry points to a previously allocated page-table
         // page, so this pointer dereference is safe.
         Some(unsafe { Self::from_vaddr(address) })
@@ -390,24 +392,24 @@ impl<P: PagingArchHandler> PTPage<P> {
 }
 
 /// Can be used to access page table entries by index.
-impl<P: PagingArchHandler> Index<usize> for PTPage<P> {
-    type Output = PTEntry<P>;
+impl<A: ArchPagingMeta, P: PagingHandler> Index<usize> for PTPage<A, P> {
+    type Output = PTEntry<A>;
 
-    fn index(&self, index: usize) -> &PTEntry<P> {
+    fn index(&self, index: usize) -> &PTEntry<A> {
         &self.entries[index]
     }
 }
 
 /// Can be used to modify page table entries by index.
-impl<P: PagingArchHandler> IndexMut<usize> for PTPage<P> {
-    fn index_mut(&mut self, index: usize) -> &mut PTEntry<P> {
+impl<A: ArchPagingMeta, P: PagingHandler> IndexMut<usize> for PTPage<A, P> {
+    fn index_mut(&mut self, index: usize) -> &mut PTEntry<A> {
         &mut self.entries[index]
     }
 }
 
 /// Mapping levels of page table entries.
 #[derive(Debug)]
-pub enum Mapping<'a, P: PagingArchHandler> {
+pub enum Mapping<'a, P: ArchPagingMeta> {
     Level3(&'a mut PTEntry<P>),
     Level2(&'a mut PTEntry<P>),
     Level1(&'a mut PTEntry<P>),
@@ -451,46 +453,41 @@ impl PageFrame {
 }
 
 /// Page table structure containing a root page with multiple entries.
-/// Generic over the page table provider implementation.
+/// Generic over the architecture metadata `A` and the page table provider `P`.
 #[repr(C)]
 #[derive(Debug)]
-pub struct GenericPageTable<P: PagingHandler> {
-    root: PTPage<P>,
-    provider: P,
+pub struct GenericPageTable<A: ArchPagingMeta, P: PagingHandler> {
+    root: PTPage<A, P>,
 }
 
-impl<P: PagingHandler> GenericPageTable<P> {
-    /// Create a new page table with zeroed root and the given provider.
-    pub fn new(provider: P) -> Self {
+impl<A: ArchPagingMeta, P: PagingHandler> Default for GenericPageTable<A, P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: ArchPagingMeta, P: PagingHandler> GenericPageTable<A, P> {
+    /// Create a new page table with zeroed root.
+    pub fn new() -> Self {
         Self {
             root: PTPage {
                 entries: [PTEntry {
                     entry: PhysAddr::null(),
                     _phantom: PhantomData,
                 }; ENTRY_COUNT],
+                _phantom: PhantomData,
             },
-            provider,
         }
     }
 
     /// Get a reference to the root page.
-    pub fn root(&self) -> &PTPage<P> {
+    pub fn root(&self) -> &PTPage<A, P> {
         &self.root
     }
 
     /// Get a mutable reference to the root page.
-    pub fn root_mut(&mut self) -> &mut PTPage<P> {
+    pub fn root_mut(&mut self) -> &mut PTPage<A, P> {
         &mut self.root
-    }
-
-    /// Get a reference to the provider.
-    pub fn provider(&self) -> &P {
-        &self.provider
-    }
-
-    /// Get a mutable reference to the provider.
-    pub fn provider_mut(&mut self) -> &mut P {
-        &mut self.provider
     }
 
     /// Computes the index within a page table at the given level for a
@@ -505,106 +502,83 @@ impl<P: PagingHandler> GenericPageTable<P> {
     }
 
     /// Walk the virtual address and return the corresponding mapping.
-    pub fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_, P> {
-        Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr)
+    pub fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_, A> {
+        Self::walk_addr_lvl3(&mut self.root, vaddr)
     }
 
     /// Walks the page table at level 3.
-    pub fn walk_addr_lvl3<'a>(
-        page: &'a mut PTPage<P>,
-        provider: &P,
-        vaddr: VirtAddr,
-    ) -> Mapping<'a, P> {
+    pub fn walk_addr_lvl3<'a>(page: &'a mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'a, A> {
         let idx = Self::index::<3>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry, provider) {
-            Some(page) => Self::walk_addr_lvl2(page, provider, vaddr),
+        match PTPage::from_entry(entry) {
+            Some(page) => Self::walk_addr_lvl2(page, vaddr),
             None => Mapping::Level3(&mut page[idx]),
         }
     }
 
     /// Walks the page table at level 2.
-    pub fn walk_addr_lvl2<'a>(
-        page: &'a mut PTPage<P>,
-        provider: &P,
-        vaddr: VirtAddr,
-    ) -> Mapping<'a, P> {
+    pub fn walk_addr_lvl2<'a>(page: &'a mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'a, A> {
         let idx = Self::index::<2>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry, provider) {
-            Some(page) => Self::walk_addr_lvl1(page, provider, vaddr),
+        match PTPage::from_entry(entry) {
+            Some(page) => Self::walk_addr_lvl1(page, vaddr),
             None => Mapping::Level2(&mut page[idx]),
         }
     }
 
     /// Walks the page table at level 1.
-    pub fn walk_addr_lvl1<'a>(
-        page: &'a mut PTPage<P>,
-        provider: &P,
-        vaddr: VirtAddr,
-    ) -> Mapping<'a, P> {
+    pub fn walk_addr_lvl1<'a>(page: &'a mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'a, A> {
         let idx = Self::index::<1>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry, provider) {
+        match PTPage::from_entry(entry) {
             Some(page) => Self::walk_addr_lvl0(page, vaddr),
             None => Mapping::Level1(&mut page[idx]),
         }
     }
 
     /// Walks the page table at level 0.
-    pub fn walk_addr_lvl0(page: &mut PTPage<P>, vaddr: VirtAddr) -> Mapping<'_, P> {
+    pub fn walk_addr_lvl0(page: &mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'_, A> {
         let idx = Self::index::<0>(vaddr);
         Mapping::Level0(&mut page[idx])
     }
 
     /// Allocates page table levels down to a 4KB PTE.
-    pub fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_, P> {
-        let m = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr);
+    pub fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_, A> {
+        let m = Self::walk_addr_lvl3(&mut self.root, vaddr);
 
         match m {
             Mapping::Level0(entry) => Mapping::Level0(entry),
-            Mapping::Level1(entry) => {
-                Self::alloc_pte_lvl1(entry, vaddr, PageSize::Regular, &mut self.provider)
-            }
-            Mapping::Level2(entry) => {
-                Self::alloc_pte_lvl2(entry, vaddr, PageSize::Regular, &mut self.provider)
-            }
-            Mapping::Level3(entry) => {
-                Self::alloc_pte_lvl3(entry, vaddr, PageSize::Regular, &mut self.provider)
-            }
+            Mapping::Level1(entry) => Self::alloc_pte_lvl1(entry, vaddr, PageSize::Regular),
+            Mapping::Level2(entry) => Self::alloc_pte_lvl2(entry, vaddr, PageSize::Regular),
+            Mapping::Level3(entry) => Self::alloc_pte_lvl3(entry, vaddr, PageSize::Regular),
         }
     }
 
     /// Allocates page table levels down to a 2MB PTE.
-    pub fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_, P> {
-        let m = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr);
+    pub fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_, A> {
+        let m = Self::walk_addr_lvl3(&mut self.root, vaddr);
 
         match m {
             Mapping::Level0(entry) => Mapping::Level0(entry),
             Mapping::Level1(entry) => Mapping::Level1(entry),
-            Mapping::Level2(entry) => {
-                Self::alloc_pte_lvl2(entry, vaddr, PageSize::Huge, &mut self.provider)
-            }
-            Mapping::Level3(entry) => {
-                Self::alloc_pte_lvl3(entry, vaddr, PageSize::Huge, &mut self.provider)
-            }
+            Mapping::Level2(entry) => Self::alloc_pte_lvl2(entry, vaddr, PageSize::Huge),
+            Mapping::Level3(entry) => Self::alloc_pte_lvl3(entry, vaddr, PageSize::Huge),
         }
     }
 
     /// Allocate at level 3, descend to level 2.
     pub fn alloc_pte_lvl3<'a>(
-        entry: &'a mut PTEntry<P>,
+        entry: &'a mut PTEntry<A>,
         vaddr: VirtAddr,
         size: PageSize,
-        provider: &mut P,
-    ) -> Mapping<'a, P> {
+    ) -> Mapping<'a, A> {
         let flags = entry.flags();
 
         if flags.contains(PTEntryFlags::PRESENT) {
             return Mapping::Level3(entry);
         }
 
-        let Ok(paddr) = provider.allocate_frame() else {
+        let Ok(paddr) = P::allocate_frame() else {
             return Mapping::Level3(entry);
         };
 
@@ -612,30 +586,29 @@ impl<P: PagingHandler> GenericPageTable<P> {
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
             | PTEntryFlags::ACCESSED;
-        entry.set_unrestricted(paddr, flags & P::feature_mask());
+        entry.set_unrestricted(paddr, flags & A::feature_mask());
 
-        let vaddr_page = provider.paddr_to_vaddr(entry.address());
+        let vaddr_page = P::paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
-        let page = unsafe { PTPage::from_vaddr(vaddr_page) };
+        let page: &mut PTPage<A, P> = unsafe { PTPage::from_vaddr(vaddr_page) };
 
         let idx = Self::index::<2>(vaddr);
-        Self::alloc_pte_lvl2(&mut page[idx], vaddr, size, provider)
+        Self::alloc_pte_lvl2(&mut page[idx], vaddr, size)
     }
 
     /// Allocate at level 2, descend to level 1.
     pub fn alloc_pte_lvl2<'a>(
-        entry: &'a mut PTEntry<P>,
+        entry: &'a mut PTEntry<A>,
         vaddr: VirtAddr,
         size: PageSize,
-        provider: &mut P,
-    ) -> Mapping<'a, P> {
+    ) -> Mapping<'a, A> {
         let flags = entry.flags();
 
         if flags.contains(PTEntryFlags::PRESENT) {
             return Mapping::Level2(entry);
         }
 
-        let Ok(paddr) = provider.allocate_frame() else {
+        let Ok(paddr) = P::allocate_frame() else {
             return Mapping::Level2(entry);
         };
 
@@ -643,30 +616,29 @@ impl<P: PagingHandler> GenericPageTable<P> {
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
             | PTEntryFlags::ACCESSED;
-        entry.set_unrestricted(paddr, flags & P::feature_mask());
+        entry.set_unrestricted(paddr, flags & A::feature_mask());
 
-        let vaddr_page = provider.paddr_to_vaddr(entry.address());
+        let vaddr_page = P::paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
-        let page = unsafe { PTPage::from_vaddr(vaddr_page) };
+        let page: &mut PTPage<A, P> = unsafe { PTPage::from_vaddr(vaddr_page) };
 
         let idx = Self::index::<1>(vaddr);
-        Self::alloc_pte_lvl1(&mut page[idx], vaddr, size, provider)
+        Self::alloc_pte_lvl1(&mut page[idx], vaddr, size)
     }
 
     /// Allocate at level 1, descend to level 0.
     pub fn alloc_pte_lvl1<'a>(
-        entry: &'a mut PTEntry<P>,
+        entry: &'a mut PTEntry<A>,
         vaddr: VirtAddr,
         size: PageSize,
-        provider: &mut P,
-    ) -> Mapping<'a, P> {
+    ) -> Mapping<'a, A> {
         let flags = entry.flags();
 
         if size == PageSize::Huge || flags.contains(PTEntryFlags::PRESENT) {
             return Mapping::Level1(entry);
         }
 
-        let Ok(paddr) = provider.allocate_frame() else {
+        let Ok(paddr) = P::allocate_frame() else {
             return Mapping::Level1(entry);
         };
 
@@ -674,11 +646,11 @@ impl<P: PagingHandler> GenericPageTable<P> {
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
             | PTEntryFlags::ACCESSED;
-        entry.set_unrestricted(paddr, flags & P::feature_mask());
+        entry.set_unrestricted(paddr, flags & A::feature_mask());
 
-        let vaddr_page = provider.paddr_to_vaddr(entry.address());
+        let vaddr_page = P::paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
-        let page = unsafe { PTPage::from_vaddr(vaddr_page) };
+        let page: &mut PTPage<A, P> = unsafe { PTPage::from_vaddr(vaddr_page) };
 
         let idx = Self::index::<0>(vaddr);
         Mapping::Level0(&mut page[idx])
@@ -695,13 +667,13 @@ impl<P: PagingHandler> GenericPageTable<P> {
 
         match mapping {
             Mapping::Level0(entry) => {
-                entry.set_unrestricted(paddr, flags & P::feature_mask());
+                entry.set_unrestricted(paddr, flags & A::feature_mask());
                 Ok(())
             }
             _ => {
                 // Allocation failed — we need an error. Since we can't create
                 // P::Error generically, attempt one more allocation to get the error.
-                Err(self.provider.allocate_frame().unwrap_err())
+                Err(P::allocate_frame().unwrap_err())
             }
         }
     }
@@ -720,10 +692,10 @@ impl<P: PagingHandler> GenericPageTable<P> {
 
         match mapping {
             Mapping::Level1(entry) => {
-                entry.set_unrestricted(paddr, (flags | PTEntryFlags::HUGE) & P::feature_mask());
+                entry.set_unrestricted(paddr, (flags | PTEntryFlags::HUGE) & A::feature_mask());
                 Ok(())
             }
-            _ => Err(self.provider.allocate_frame().unwrap_err()),
+            _ => Err(P::allocate_frame().unwrap_err()),
         }
     }
 
@@ -800,9 +772,9 @@ impl<P: PagingHandler> GenericPageTable<P> {
         shared: bool,
     ) -> Result<(), P::Error> {
         let addr = if shared {
-            P::make_shared_address(paddr)
+            A::make_shared_address(paddr)
         } else {
-            P::make_private_address(paddr)
+            A::make_private_address(paddr)
         };
         self.map_4k(vaddr, addr, flags)
     }
@@ -819,22 +791,22 @@ impl<P: PagingHandler> GenericPageTable<P> {
         shared: bool,
     ) -> Result<(), P::Error> {
         let addr = if shared {
-            P::make_shared_address(paddr)
+            A::make_shared_address(paddr)
         } else {
-            P::make_private_address(paddr)
+            A::make_private_address(paddr)
         };
         self.map_2m(vaddr, addr, flags)
     }
 }
 
 /// Methods requiring TLB flush support (splitting, encryption changes).
-impl<P: PagingHandler> GenericPageTable<P> {
+impl<A: ArchPagingMeta, P: PagingHandler> GenericPageTable<A, P> {
     /// Splits a 2MB page into 4KB pages.
-    fn do_split_4k(provider: &mut P, entry: &mut PTEntry<P>) -> Result<(), P::Error> {
-        let paddr = provider.allocate_frame()?;
-        let vaddr_page = provider.paddr_to_vaddr(paddr);
+    fn do_split_4k(entry: &mut PTEntry<A>) -> Result<(), P::Error> {
+        let paddr = P::allocate_frame()?;
+        let vaddr_page = P::paddr_to_vaddr(paddr);
         // SAFETY: We just allocated a zeroed frame at this address.
-        let page: &mut PTPage<P> = unsafe { PTPage::from_vaddr(vaddr_page) };
+        let page: &mut PTPage<A, P> = unsafe { PTPage::from_vaddr(vaddr_page) };
 
         let mut flags = entry.flags();
         assert!(flags.contains(PTEntryFlags::HUGE));
@@ -847,63 +819,61 @@ impl<P: PagingHandler> GenericPageTable<P> {
         for (i, e) in page.entries.iter_mut().enumerate() {
             let addr_4k = addr_2m + (i * PAGE_SIZE);
             e.clear();
-            e.set_unrestricted(P::make_private_address(addr_4k), flags & P::feature_mask());
+            e.set_unrestricted(A::make_private_address(addr_4k), flags & A::feature_mask());
         }
 
-        entry.set_unrestricted(P::make_private_address(paddr), flags & P::feature_mask());
+        entry.set_unrestricted(A::make_private_address(paddr), flags & A::feature_mask());
 
-        P::flush_tlb_global();
+        A::flush_tlb_global();
 
         Ok(())
     }
 
     /// Sets the shared encryption state on a PTE.
-    fn make_pte_shared(entry: &mut PTEntry<P>) {
+    fn make_pte_shared(entry: &mut PTEntry<A>) {
         let flags = entry.flags();
         let addr = entry.address();
-        entry.set_unrestricted(P::make_shared_address(addr), flags);
+        entry.set_unrestricted(A::make_shared_address(addr), flags);
     }
 
     /// Sets the private encryption state on a PTE.
-    fn make_pte_private(entry: &mut PTEntry<P>) {
+    fn make_pte_private(entry: &mut PTEntry<A>) {
         let flags = entry.flags();
         let addr = entry.address();
-        entry.set_unrestricted(P::make_private_address(addr), flags);
+        entry.set_unrestricted(A::make_private_address(addr), flags);
     }
 
     /// Sets the shared state for a 4KB page, splitting from 2MB if needed.
     pub fn set_shared_4k(&mut self, vaddr: VirtAddr) -> Result<(), P::Error> {
-        if let Mapping::Level1(entry) = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr)
-        {
-            Self::do_split_4k(&mut self.provider, entry)?;
+        if let Mapping::Level1(entry) = Self::walk_addr_lvl3(&mut self.root, vaddr) {
+            Self::do_split_4k(entry)?;
         }
 
         if let Mapping::Level0(entry) = self.walk_addr(vaddr) {
             Self::make_pte_shared(entry);
             Ok(())
         } else {
-            Err(self.provider.allocate_frame().unwrap_err())
+            Err(P::allocate_frame().unwrap_err())
         }
     }
 
     /// Sets the private (encrypted) state for a 4KB page, splitting from 2MB if needed.
     pub fn set_encrypted_4k(&mut self, vaddr: VirtAddr) -> Result<(), P::Error> {
-        if let Mapping::Level1(entry) = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr)
-        {
-            Self::do_split_4k(&mut self.provider, entry)?;
+        if let Mapping::Level1(entry) = Self::walk_addr_lvl3(&mut self.root, vaddr) {
+            Self::do_split_4k(entry)?;
         }
 
         if let Mapping::Level0(entry) = self.walk_addr(vaddr) {
             Self::make_pte_private(entry);
             Ok(())
         } else {
-            Err(self.provider.allocate_frame().unwrap_err())
+            Err(P::allocate_frame().unwrap_err())
         }
     }
 }
 
 /// Methods available only when the provider supports self-mapped page tables.
-impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
+impl<A: ArchPagingMeta, P: PagingHandler + SelfMap> GenericPageTable<A, P> {
     /// Compute the virtual address of the PTE that maps `vaddr`,
     /// using the self-map region of the currently active page table.
     fn get_pte_address(vaddr: VirtAddr) -> VirtAddr {
@@ -929,14 +899,14 @@ impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
 
         // SAFETY: Reading PTE hierarchy top-down through self-map addresses.
         // Each level is checked for presence before reading the next.
-        let pml4e: PTEntry<P> = unsafe { PTEntry::read_pte(pml4e_addr) };
+        let pml4e: PTEntry<A> = unsafe { PTEntry::read_pte(pml4e_addr) };
         if !pml4e.present() {
             return None;
         }
 
         // SAFETY: The PML4E was checked to be present, so the PDPE exists
         // and can be read safely via the self-map.
-        let pdpe: PTEntry<P> = unsafe { PTEntry::read_pte(pdpe_addr) };
+        let pdpe: PTEntry<A> = unsafe { PTEntry::read_pte(pdpe_addr) };
         if !pdpe.present() {
             return None;
         }
@@ -947,7 +917,7 @@ impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
 
         // SAFETY: The PDPE was checked to be present and not huge,
         // so the PDE exists and can be read safely via the self-map.
-        let pde: PTEntry<P> = unsafe { PTEntry::read_pte(pde_addr) };
+        let pde: PTEntry<A> = unsafe { PTEntry::read_pte(pde_addr) };
         if !pde.present() {
             return None;
         }
@@ -958,7 +928,7 @@ impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
 
         // SAFETY: The PDE was checked to be present and not huge,
         // so the PTE exists and can be read safely via the self-map.
-        let pte: PTEntry<P> = unsafe { PTEntry::read_pte(pte_addr) };
+        let pte: PTEntry<A> = unsafe { PTEntry::read_pte(pte_addr) };
         if pte.present() {
             let pa = pte.page_frame() + (usize::from(vaddr) & 0xFFF);
             Some(PageFrame::Size4K(pa))

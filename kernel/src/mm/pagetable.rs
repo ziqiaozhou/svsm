@@ -27,7 +27,7 @@ use zerocopy::FromZeros;
 
 // Re-export types from the paging crate.
 pub use paging::pagetable::{
-    ENTRY_COUNT, PTEntryFlags, PageFrame, PagingArchHandler, PagingHandler, PagingMode, SelfMap,
+    ArchPagingMeta, ENTRY_COUNT, PTEntryFlags, PageFrame, PagingHandler, PagingMode, SelfMap,
 };
 
 /// Mask for private page table entry.
@@ -121,9 +121,9 @@ fn strip_shared_address_bits(paddr: PhysAddr) -> PhysAddr {
     (paddr.bits() & !shared_pte_mask()).into()
 }
 
-pub type PTEntry = paging::pagetable::PTEntry<SvsmPTProvider>;
-pub type PTPage = paging::pagetable::PTPage<SvsmPTProvider>;
-pub type Mapping<'a> = paging::pagetable::Mapping<'a, SvsmPTProvider>;
+pub type PTEntry = paging::pagetable::PTEntry<SvsmPaging>;
+pub type PTPage = paging::pagetable::PTPage<SvsmPaging, SvsmPaging>;
+pub type Mapping<'a> = paging::pagetable::Mapping<'a, SvsmPaging>;
 
 pub trait SvsmPTEntryExt {
     /// Check if the page table entry has reserved bits set.
@@ -242,7 +242,7 @@ unsafe fn pt_page_free(page: &'static PTPage) {
 }
 
 fn pt_page_from_entry(entry: PTEntry) -> Option<&'static mut PTPage> {
-    PTPage::from_entry(entry, &SvsmPTProvider)
+    PTPage::from_entry(entry)
 }
 
 /// Page table structure containing a root page with multiple entries.
@@ -992,7 +992,7 @@ impl PageTable {
 
                     let flags = PTEntryFlags::data_ro();
 
-                    let paddr = if SvsmPTProvider::is_shared_address(entry.raw_address()) {
+                    let paddr = if SvsmPaging::is_shared_address(entry.raw_address()) {
                         make_shared_address(entry.address())
                     } else {
                         make_private_address(entry.address())
@@ -1016,9 +1016,9 @@ impl PageTable {
 
 /// The SVSM page table provider: frame mapping, allocation, and encryption masks.
 #[derive(Debug, Clone, Copy)]
-pub struct SvsmPTProvider;
+pub struct SvsmPaging;
 
-impl PagingArchHandler for SvsmPTProvider {
+impl ArchPagingMeta for SvsmPaging {
     fn private_pte_mask() -> usize {
         private_pte_mask()
     }
@@ -1038,21 +1038,21 @@ impl PagingArchHandler for SvsmPTProvider {
 
 // SAFETY: paddr_to_vaddr correctly maps physical addresses via phys_to_virt,
 // and allocate_frame returns unique zeroed frames via PageBox.
-unsafe impl PagingHandler for SvsmPTProvider {
+unsafe impl PagingHandler for SvsmPaging {
     type Error = SvsmError;
 
-    fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr {
+    fn paddr_to_vaddr(paddr: PhysAddr) -> VirtAddr {
         phys_to_virt(strip_confidentiality_bits(paddr))
     }
 
-    fn allocate_frame(&mut self) -> Result<PhysAddr, SvsmError> {
+    fn allocate_frame() -> Result<PhysAddr, SvsmError> {
         let page = pt_page_alloc_box()?;
         let paddr = virt_to_phys(page.vaddr());
         let _ = PageBox::leak(page);
         Ok(make_private_address(paddr))
     }
 
-    unsafe fn deallocate_frame(&mut self, paddr: PhysAddr) {
+    unsafe fn deallocate_frame(paddr: PhysAddr) {
         let vaddr = phys_to_virt(strip_confidentiality_bits(paddr));
         // SAFETY: paddr was returned by allocate_frame (via PageBox::leak),
         // so reconstructing the PageBox from the same pointer is valid.
@@ -1063,14 +1063,14 @@ unsafe impl PagingHandler for SvsmPTProvider {
     }
 }
 
-impl SelfMap for SvsmPTProvider {
+impl SelfMap for SvsmPaging {
     fn pte_base() -> VirtAddr {
         SVSM_PTE_BASE
     }
 }
 
 /// Kernel page table type alias using the generic paging crate GenericPageTable.
-pub type KernelPageTable = paging::GenericPageTable<SvsmPTProvider>;
+pub type KernelPageTable = paging::GenericPageTable<SvsmPaging, SvsmPaging>;
 
 /// Extension trait for [`PageFrame`] that applies SVSM encryption masks.
 pub trait SvsmPageFrameExt {
@@ -1082,11 +1082,11 @@ pub trait SvsmPageFrameExt {
 
 impl SvsmPageFrameExt for PageFrame {
     fn page_frame(&self) -> PhysAddr {
-        SvsmPTProvider::strip_confidentiality_bits(self.address())
+        SvsmPaging::strip_confidentiality_bits(self.address())
     }
 
     fn clean_address(&self) -> PhysAddr {
-        SvsmPTProvider::strip_shared_address_bits(self.page_frame())
+        SvsmPaging::strip_shared_address_bits(self.page_frame())
     }
 }
 
