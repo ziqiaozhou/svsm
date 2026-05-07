@@ -11,7 +11,7 @@ use core::ops::{Add, BitAnd, Not, Sub};
 use verus_stub::*;
 
 #[cfg(verus_keep_ghost)]
-include!("util.verus.rs");
+use verify_proof::align::*;
 
 #[verus_spec(ret =>
     requires

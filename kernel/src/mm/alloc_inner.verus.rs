@@ -5,13 +5,13 @@
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
 //
 // Spec and proofs that does not need private types in alloc.rs
-use crate::mm::alloc::VirtAddr;
 use crate::mm::LinearMap;
-use crate::types::{lemma_page_size, PAGE_SIZE};
-use crate::utils::util::spec_align_up;
+use crate::mm::alloc::VirtAddr;
+use crate::types::{PAGE_SIZE, lemma_page_size};
 
 use crate::mm::alloc::MAX_ORDER;
 use verify_external::hw_spec::SpecVAddrImpl;
+use verify_proof::align::spec_align_up;
 use verify_proof::bits::*;
 use verify_proof::frac_ptr::*;
 use verify_proof::nonlinear::*;

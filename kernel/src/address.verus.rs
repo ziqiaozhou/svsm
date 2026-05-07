@@ -4,12 +4,12 @@
 //
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
 //
-use crate::utils::util::{
-    align_down_integer_ens, align_up_integer_ens, proof_align_down, proof_align_up,
-};
 use verify_external::convert::{exists_into, forall_into};
 use verify_external::hw_spec::SpecVAddrImpl;
-use vstd::raw_ptr::{ptr_from_data, ptr_mut_from_data, PtrData};
+use verify_proof::align::{
+    align_down_integer_ens, align_up_integer_ens, proof_align_down, proof_align_up,
+};
+use vstd::raw_ptr::{PtrData, ptr_from_data, ptr_mut_from_data};
 use vstd::set_lib::set_int_range;
 use vstd::std_specs::cmp::PartialOrdSpec;
 use vstd::std_specs::convert::{FromSpec, IntoSpec};

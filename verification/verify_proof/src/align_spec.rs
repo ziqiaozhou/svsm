@@ -5,6 +5,8 @@
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
 //
 // Specifications related to util.rs that are used in proof_align_down and proof_align_up.
+use core::ops::{Add, BitAnd, Not, Sub};
+use vstd::prelude::*;
 use vstd::std_specs::ops::{AddSpec, BitAndSpec, NotSpec, SubSpec};
 
 #[verus_verify]
@@ -57,7 +59,7 @@ impl<T> IsAlignedSpec for T where
 
 verus! {
 
-use verify_proof::bits::is_pow_of_2;
+use crate::bits::is_pow_of_2;
 
 #[verifier(inline)]
 pub open spec fn align_requires(align: u64) -> bool {
@@ -154,4 +156,3 @@ pub open spec fn spec_is_aligned<T>(val: T, align: T) -> bool where T: IsAligned
 }
 
 } // verus!
-include!("util.proof.verus.rs");
