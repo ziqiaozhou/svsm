@@ -16,6 +16,7 @@ use bitflags::bitflags;
 use core::marker::PhantomData;
 use core::ops::{Index, IndexMut};
 use registers::{CR0Flags, CR4Flags, EFERFlags};
+use zerocopy::{FromBytes, FromZeros, Maybe, TryFromBytes};
 
 /// Number of entries in a page table (4KB/8B).
 pub const ENTRY_COUNT: usize = 512;
@@ -204,6 +205,29 @@ impl<P: PagingArchHandler> Clone for PTEntry<P> {
     }
 }
 
+// SAFETY: `PTEntry<P>` is a repr(C) wrapper around `PhysAddr` plus zero-sized
+// `PhantomData`, so every initialized byte pattern valid for `PhysAddr` is also
+// valid for `PTEntry<P>`, independent of `P`.
+unsafe impl<P: PagingArchHandler> TryFromBytes for PTEntry<P> {
+    fn is_bit_valid<A: zerocopy::pointer::invariant::Reference>(
+        _candidate: Maybe<'_, Self, A>,
+    ) -> bool {
+        true
+    }
+
+    fn only_derive_is_allowed_to_implement_this_trait() {}
+}
+
+// SAFETY: Zero is a valid value for `PhysAddr`, and `PhantomData` is zero-sized.
+unsafe impl<P: PagingArchHandler> FromZeros for PTEntry<P> {
+    fn only_derive_is_allowed_to_implement_this_trait() {}
+}
+
+// SAFETY: `PTEntry<P>` has no invalid bit patterns beyond those of `PhysAddr`.
+unsafe impl<P: PagingArchHandler> FromBytes for PTEntry<P> {
+    fn only_derive_is_allowed_to_implement_this_trait() {}
+}
+
 impl<P: PagingArchHandler> PTEntry<P> {
     /// Check if the page table entry is clear (null).
     pub fn is_clear(&self) -> bool {
@@ -311,6 +335,28 @@ impl<P: PagingArchHandler> PTEntry<P> {
 #[derive(Debug)]
 pub struct PTPage<P: PagingArchHandler> {
     pub entries: [PTEntry<P>; ENTRY_COUNT],
+}
+
+// SAFETY: `PTPage<P>` is a repr(C) array of `PTEntry<P>` values, and arrays of
+// `FromBytes` elements are valid for any initialized byte sequence.
+unsafe impl<P: PagingArchHandler> TryFromBytes for PTPage<P> {
+    fn is_bit_valid<A: zerocopy::pointer::invariant::Reference>(
+        _candidate: Maybe<'_, Self, A>,
+    ) -> bool {
+        true
+    }
+
+    fn only_derive_is_allowed_to_implement_this_trait() {}
+}
+
+// SAFETY: Zero-initializing each `PTEntry<P>` yields a valid zeroed PT page.
+unsafe impl<P: PagingArchHandler> FromZeros for PTPage<P> {
+    fn only_derive_is_allowed_to_implement_this_trait() {}
+}
+
+// SAFETY: `PTPage<P>` contains only `PTEntry<P>` elements.
+unsafe impl<P: PagingArchHandler> FromBytes for PTPage<P> {
+    fn only_derive_is_allowed_to_implement_this_trait() {}
 }
 
 impl<P: PagingArchHandler> PTPage<P> {

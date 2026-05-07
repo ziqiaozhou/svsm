@@ -22,9 +22,7 @@ use crate::utils::MemoryRegion;
 use crate::utils::immut_after_init::{ImmutAfterInitCell, ImmutAfterInitResult};
 use bitflags::bitflags;
 use core::cmp;
-use core::ops::{Index, IndexMut};
 use core::ptr::NonNull;
-use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 
 // Re-export types from the paging crate.
@@ -105,11 +103,6 @@ pub fn max_phys_addr() -> PhysAddr {
     PhysAddr::from(*MAX_PHYS_ADDR)
 }
 
-/// Returns the supported flags considering the feature mask.
-fn supported_flags(flags: PTEntryFlags) -> PTEntryFlags {
-    flags & *FEATURE_MASK
-}
-
 /// Set address as shared via mask.
 fn make_shared_address(paddr: PhysAddr) -> PhysAddr {
     (strip_confidentiality_bits(paddr).bits() | shared_pte_mask()).into()
@@ -120,11 +113,6 @@ pub fn make_private_address(paddr: PhysAddr) -> PhysAddr {
     (strip_shared_address_bits(paddr).bits() | private_pte_mask()).into()
 }
 
-// Returns true if the address is shared.
-fn is_shared(paddr: PhysAddr) -> bool {
-    paddr == make_shared_address(paddr)
-}
-
 fn strip_confidentiality_bits(paddr: PhysAddr) -> PhysAddr {
     (paddr.bits() & !private_pte_mask()).into()
 }
@@ -133,54 +121,17 @@ fn strip_shared_address_bits(paddr: PhysAddr) -> PhysAddr {
     (paddr.bits() & !shared_pte_mask()).into()
 }
 
-/// Represents a page table entry.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, FromBytes)]
-pub struct PTEntry(PhysAddr);
+pub type PTEntry = paging::pagetable::PTEntry<SvsmPTProvider>;
+pub type PTPage = paging::pagetable::PTPage<SvsmPTProvider>;
+pub type Mapping<'a> = paging::pagetable::Mapping<'a, SvsmPTProvider>;
 
-impl PTEntry {
-    /// Check if the page table entry is clear (null).
-    pub fn is_clear(&self) -> bool {
-        self.0.is_null()
-    }
-
-    /// Clear the page table entry.
-    pub fn clear(&mut self) {
-        self.0 = PhysAddr::null();
-    }
-
-    /// Check if the page table entry is present.
-    pub fn present(&self) -> bool {
-        self.flags().contains(PTEntryFlags::PRESENT)
-    }
-
-    /// Check if the page table entry is huge.
-    pub fn huge(&self) -> bool {
-        self.flags().contains(PTEntryFlags::HUGE)
-    }
-
-    /// Check if the page table entry is writable.
-    pub fn writable(&self) -> bool {
-        self.flags().contains(PTEntryFlags::WRITABLE)
-    }
-
-    /// Check if the page table entry is NX (no-execute).
-    pub fn nx(&self) -> bool {
-        self.flags().contains(PTEntryFlags::NX)
-    }
-
-    /// Check if the page table entry is user-accessible.
-    pub fn user(&self) -> bool {
-        self.flags().contains(PTEntryFlags::USER)
-    }
-
-    /// Check if the page table entry is global.
-    pub fn global(&self) -> bool {
-        self.flags().contains(PTEntryFlags::GLOBAL)
-    }
-
+pub trait SvsmPTEntryExt {
     /// Check if the page table entry has reserved bits set.
-    pub fn has_reserved_bits(&self, pm: PagingMode, level: usize) -> bool {
+    fn has_reserved_bits(&self, pm: PagingMode, level: usize) -> bool;
+}
+
+impl SvsmPTEntryExt for PTEntry {
+    fn has_reserved_bits(&self, pm: PagingMode, level: usize) -> bool {
         let reserved_mask = match pm {
             PagingMode::NoPaging => unreachable!("NoPaging does not have page table"),
             PagingMode::NonPAE => {
@@ -270,153 +221,28 @@ impl PTEntry {
 
         self.raw() & reserved_mask != 0
     }
+}
 
-    /// Get the raw bits (`u64`) of the page table entry.
-    pub fn raw(&self) -> u64 {
-        self.0.bits() as u64
-    }
+fn pt_page_alloc_box() -> Result<PageBox<PTPage>, SvsmError> {
+    PageBox::try_new_zeroed()
+}
 
-    /// Get the flags of the page table entry.
-    pub fn flags(&self) -> PTEntryFlags {
-        PTEntryFlags::from_bits_truncate(self.0.bits() as u64)
-    }
+fn pt_page_alloc() -> Result<(&'static mut PTPage, PhysAddr), SvsmError> {
+    let page = pt_page_alloc_box()?;
+    let paddr = virt_to_phys(page.vaddr());
+    Ok((PageBox::leak(page), paddr))
+}
 
-    /// Set the page table entry with the specified address and flags.
-    pub fn set_unrestricted(&mut self, addr: PhysAddr, flags: PTEntryFlags) {
-        let addr = addr.bits() as u64;
-        assert_eq!(addr & !0x000f_ffff_ffff_f000, 0);
-        self.0 = PhysAddr::from(addr | flags.bits());
-    }
-
-    /// Set the page table entry with the specified address, with flags
-    /// constrained to the supported feature flags.
-    pub fn set(&mut self, addr: PhysAddr, flags: PTEntryFlags) {
-        self.set_unrestricted(addr, supported_flags(flags));
-    }
-
-    /// Inserts the private address mask if the page is present.
-    pub fn make_private_if_present(&mut self) {
-        if self.flags().contains(PTEntryFlags::PRESENT) {
-            self.0 = make_private_address(self.0);
-        }
-    }
-
-    /// Get the address from the page table entry, including the shared bit.
-    pub fn page_frame(&self) -> PhysAddr {
-        let addr = PhysAddr::from(self.0.bits() & 0x000f_ffff_ffff_f000);
-        strip_confidentiality_bits(addr)
-    }
-
-    /// Get the address from the page table entry, excluding the C/shared bit.
-    pub fn address(&self) -> PhysAddr {
-        strip_shared_address_bits(self.page_frame())
-    }
-
-    /// Read a page table entry from the specified virtual address.
-    ///
-    /// # Safety
-    ///
-    /// Reads from an arbitrary virtual address, making this essentially a
-    /// raw pointer read.  The caller must be certain to calculate the correct
-    /// address.
-    pub unsafe fn read_pte(vaddr: VirtAddr) -> Self {
-        // SAFETY: When the methods safety requirements are met, the raw
-        // pointer read is safe.
-        unsafe { *vaddr.as_ptr::<Self>() }
+unsafe fn pt_page_free(page: &'static PTPage) {
+    // SAFETY: The given page was previously allocated via pt_page_alloc
+    // (which leaks a PageBox), so reconstructing a PageBox here is valid.
+    unsafe {
+        let _ = PageBox::from_raw(NonNull::from(page));
     }
 }
 
-/// A pagetable page with multiple entries.
-#[repr(C)]
-#[derive(Debug, FromBytes)]
-pub struct PTPage {
-    entries: [PTEntry; ENTRY_COUNT],
-}
-
-impl PTPage {
-    /// Allocates a zeroed pagetable page and returns a `PageBox` containing
-    /// the allocation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SvsmError`] if the page cannot be allocated.
-    pub fn alloc_box() -> Result<PageBox<Self>, SvsmError> {
-        PageBox::try_new_zeroed()
-    }
-
-    /// Allocates a zeroed pagetable page and returns a mutable reference to
-    /// it, plus its physical address.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SvsmError`] if the page cannot be allocated.
-    fn alloc() -> Result<(&'static mut Self, PhysAddr), SvsmError> {
-        let page = Self::alloc_box()?;
-        let paddr = virt_to_phys(page.vaddr());
-        Ok((PageBox::leak(page), paddr))
-    }
-
-    /// Frees a pagetable page.
-    ///
-    /// # Safety
-    ///
-    /// The given reference must correspond to a valid previously allocated
-    /// page table page.
-    unsafe fn free(page: &'static Self) {
-        // SAFETY: The page put into the PageBox is a previously allocated
-        // page table page.
-        unsafe {
-            let _ = PageBox::from_raw(NonNull::from(page));
-        }
-    }
-
-    /// Converts a pagetable entry to a mutable reference to a [`PTPage`],
-    /// if the entry is present and not huge.
-    fn from_entry(entry: PTEntry) -> Option<&'static mut Self> {
-        let flags = entry.flags();
-        if !flags.contains(PTEntryFlags::PRESENT) || flags.contains(PTEntryFlags::HUGE) {
-            return None;
-        }
-
-        let address = phys_to_virt(entry.address());
-        // SAFETY: Every PTEntry points to a previously allocated page-table
-        // page, so this pointer dereference is safe.
-        Some(unsafe { Self::from_vaddr(address) })
-    }
-
-    /// Generates a `PTPage` from a virtual address.
-    /// # Safety
-    /// The caller must ensure that the virtual address is a valid page table.
-    pub unsafe fn from_vaddr(vaddr: VirtAddr) -> &'static mut Self {
-        // SAFETY: the caller guarantees the correctness of the virtual
-        // address.
-        unsafe { &mut *vaddr.as_mut_ptr::<PTPage>() }
-    }
-}
-
-/// Can be used to access page table entries by index.
-impl Index<usize> for PTPage {
-    type Output = PTEntry;
-
-    fn index(&self, index: usize) -> &PTEntry {
-        &self.entries[index]
-    }
-}
-
-/// Can be used to modify page table entries by index.
-impl IndexMut<usize> for PTPage {
-    fn index_mut(&mut self, index: usize) -> &mut PTEntry {
-        &mut self.entries[index]
-    }
-}
-
-/// Mapping levels of page table entries.
-#[derive(Debug)]
-pub enum Mapping<'a> {
-    Level3(&'a mut PTEntry),
-    Level2(&'a mut PTEntry),
-    Level1(&'a mut PTEntry),
-    Level0(&'a mut PTEntry),
+fn pt_page_from_entry(entry: PTEntry) -> Option<&'static mut PTPage> {
+    PTPage::from_entry(entry, &SvsmPTProvider)
 }
 
 /// Page table structure containing a root page with multiple entries.
@@ -519,7 +345,7 @@ impl PageTable {
     fn walk_addr_lvl1(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
         let idx = Self::index::<1>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry) {
+        match pt_page_from_entry(entry) {
             Some(page) => Self::walk_addr_lvl0(page, vaddr),
             None => Mapping::Level1(&mut page[idx]),
         }
@@ -536,7 +362,7 @@ impl PageTable {
     fn walk_addr_lvl2(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
         let idx = Self::index::<2>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry) {
+        match pt_page_from_entry(entry) {
             Some(page) => Self::walk_addr_lvl1(page, vaddr),
             None => Mapping::Level2(&mut page[idx]),
         }
@@ -553,7 +379,7 @@ impl PageTable {
     fn walk_addr_lvl3(page: &mut PTPage, vaddr: VirtAddr) -> Mapping<'_> {
         let idx = Self::index::<3>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry) {
+        match pt_page_from_entry(entry) {
             Some(page) => Self::walk_addr_lvl2(page, vaddr),
             None => Mapping::Level3(&mut page[idx]),
         }
@@ -653,7 +479,7 @@ impl PageTable {
             return Mapping::Level3(entry);
         }
 
-        let Ok((page, paddr)) = PTPage::alloc() else {
+        let Ok((page, paddr)) = pt_page_alloc() else {
             return Mapping::Level3(entry);
         };
 
@@ -674,7 +500,7 @@ impl PageTable {
             return Mapping::Level2(entry);
         }
 
-        let Ok((page, paddr)) = PTPage::alloc() else {
+        let Ok((page, paddr)) = pt_page_alloc() else {
             return Mapping::Level2(entry);
         };
 
@@ -695,7 +521,7 @@ impl PageTable {
             return Mapping::Level1(entry);
         }
 
-        let Ok((page, paddr)) = PTPage::alloc() else {
+        let Ok((page, paddr)) = pt_page_alloc() else {
             return Mapping::Level1(entry);
         };
 
@@ -753,7 +579,7 @@ impl PageTable {
     /// # Returns
     /// A result indicating success or an error [`SvsmError`] in failure.
     fn do_split_4k(entry: &mut PTEntry) -> Result<(), SvsmError> {
-        let (page, paddr) = PTPage::alloc()?;
+        let (page, paddr) = pt_page_alloc()?;
         let mut flags = entry.flags();
 
         assert!(flags.contains(PTEntryFlags::HUGE));
@@ -1166,7 +992,7 @@ impl PageTable {
 
                     let flags = PTEntryFlags::data_ro();
 
-                    let paddr = if is_shared(entry.0) {
+                    let paddr = if SvsmPTProvider::is_shared_address(entry.raw_address()) {
                         make_shared_address(entry.address())
                     } else {
                         make_private_address(entry.address())
@@ -1204,6 +1030,10 @@ impl PagingArchHandler for SvsmPTProvider {
     fn flush_tlb_global() {
         flush_tlb_global_sync();
     }
+
+    fn feature_mask() -> PTEntryFlags {
+        *FEATURE_MASK
+    }
 }
 
 // SAFETY: paddr_to_vaddr correctly maps physical addresses via phys_to_virt,
@@ -1216,7 +1046,7 @@ unsafe impl PagingHandler for SvsmPTProvider {
     }
 
     fn allocate_frame(&mut self) -> Result<PhysAddr, SvsmError> {
-        let page: PageBox<PTPage> = PageBox::try_new_zeroed()?;
+        let page = pt_page_alloc_box()?;
         let paddr = virt_to_phys(page.vaddr());
         let _ = PageBox::leak(page);
         Ok(make_private_address(paddr))
@@ -1270,11 +1100,11 @@ impl RawPageTablePart {
     /// Frees a level 1 page table.
     fn free_lvl1(page: &PTPage) {
         for entry in page.entries.iter() {
-            if let Some(page) = PTPage::from_entry(*entry) {
+            if let Some(page) = pt_page_from_entry(*entry) {
                 // SAFETY: the page comes from an entry in the page table,
                 // which we allocated using `PTPage::alloc()`, so this is
                 // safe.
-                unsafe { PTPage::free(page) };
+                unsafe { pt_page_free(page) };
             }
         }
     }
@@ -1282,12 +1112,12 @@ impl RawPageTablePart {
     /// Frees a level 2 page table, including all level 1 tables beneath it.
     fn free_lvl2(page: &PTPage) {
         for entry in page.entries.iter() {
-            if let Some(l1_page) = PTPage::from_entry(*entry) {
+            if let Some(l1_page) = pt_page_from_entry(*entry) {
                 Self::free_lvl1(l1_page);
                 // SAFETY: the page comes from an entry in the page table,
                 // which we allocated using `PTPage::alloc()`, so this is
                 // safe.
-                unsafe { PTPage::free(l1_page) };
+                unsafe { pt_page_free(l1_page) };
             }
         }
     }
