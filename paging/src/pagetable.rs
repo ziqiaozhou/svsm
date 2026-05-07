@@ -122,7 +122,7 @@ unsafe impl<T: PageTableFrameMapping + PageTableFrameAllocator + PageEncryptionM
 /// the hardware provides a virtual address window through which all PTEs
 /// of the active page table can be read directly. This trait provides the
 /// base address of that window.
-pub trait SelfMap: PageEncryptionMasks {
+pub trait SelfMap {
     /// Returns the virtual base address of the PTE self-map region.
     fn pte_base() -> VirtAddr;
 }
