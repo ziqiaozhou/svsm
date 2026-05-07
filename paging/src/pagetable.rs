@@ -38,6 +38,13 @@ pub trait PagingArchHandler {
     /// Flush the TLB globally and synchronize across all CPUs.
     fn flush_tlb_global();
 
+    /// Returns the feature mask for filtering page table entry flags.
+    /// Only flags present in this mask will be applied when setting entries.
+    /// Default: all flags allowed.
+    fn feature_mask() -> PTEntryFlags {
+        PTEntryFlags::all()
+    }
+
     // --- Default methods (derived from the masks above) ---
 
     /// Strips the private encryption bit(s) from a physical address.
@@ -235,7 +242,7 @@ impl PTEntry {
 
     /// Set the page table entry with the specified address and flags.
     /// This is the raw set — no flag filtering or encryption handling.
-    pub fn set(&mut self, addr: PhysAddr, flags: PTEntryFlags) {
+    pub fn set_unrestricted(&mut self, addr: PhysAddr, flags: PTEntryFlags) {
         let addr = addr.bits() as u64;
         assert_eq!(addr & !0x000f_ffff_ffff_f000, 0);
         self.0 = PhysAddr::from(addr | flags.bits());
@@ -245,17 +252,6 @@ impl PTEntry {
     /// Does NOT strip any encryption/confidentiality bits.
     pub fn address(&self) -> PhysAddr {
         PhysAddr::from(self.raw() & 0x000f_ffff_ffff_f000)
-    }
-
-    /// Set the page table entry with the specified address and flags,
-    /// filtering flags through the given feature mask.
-    pub fn set_with_feature_mask(
-        &mut self,
-        addr: PhysAddr,
-        flags: PTEntryFlags,
-        feature_mask: PTEntryFlags,
-    ) {
-        self.set(addr, flags & feature_mask);
     }
 
     /// Read a page table entry from the specified virtual address.
@@ -514,7 +510,7 @@ impl<P: PagingHandler> PageTable<P> {
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
             | PTEntryFlags::ACCESSED;
-        entry.set(paddr, flags);
+        entry.set_unrestricted(paddr, flags & P::feature_mask());
 
         let vaddr_page = provider.paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
@@ -545,7 +541,7 @@ impl<P: PagingHandler> PageTable<P> {
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
             | PTEntryFlags::ACCESSED;
-        entry.set(paddr, flags);
+        entry.set_unrestricted(paddr, flags & P::feature_mask());
 
         let vaddr_page = provider.paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
@@ -576,7 +572,7 @@ impl<P: PagingHandler> PageTable<P> {
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
             | PTEntryFlags::ACCESSED;
-        entry.set(paddr, flags);
+        entry.set_unrestricted(paddr, flags & P::feature_mask());
 
         let vaddr_page = provider.paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
@@ -597,7 +593,7 @@ impl<P: PagingHandler> PageTable<P> {
 
         match mapping {
             Mapping::Level0(entry) => {
-                entry.set(paddr, flags);
+                entry.set_unrestricted(paddr, flags & P::feature_mask());
                 Ok(())
             }
             _ => {
@@ -622,7 +618,7 @@ impl<P: PagingHandler> PageTable<P> {
 
         match mapping {
             Mapping::Level1(entry) => {
-                entry.set(paddr, flags | PTEntryFlags::HUGE);
+                entry.set_unrestricted(paddr, (flags | PTEntryFlags::HUGE) & P::feature_mask());
                 Ok(())
             }
             _ => Err(self.provider.allocate_frame().unwrap_err()),
@@ -750,10 +746,10 @@ impl<P: PagingHandler> PageTable<P> {
         for (i, e) in page.entries.iter_mut().enumerate() {
             let addr_4k = addr_2m + (i * PAGE_SIZE);
             e.clear();
-            e.set(P::make_private_address(addr_4k), flags);
+            e.set_unrestricted(P::make_private_address(addr_4k), flags & P::feature_mask());
         }
 
-        entry.set(P::make_private_address(paddr), flags);
+        entry.set_unrestricted(P::make_private_address(paddr), flags & P::feature_mask());
 
         P::flush_tlb_global();
 
@@ -764,14 +760,14 @@ impl<P: PagingHandler> PageTable<P> {
     fn make_pte_shared(entry: &mut PTEntry) {
         let flags = entry.flags();
         let addr = entry.address();
-        entry.set(P::make_shared_address(addr), flags);
+        entry.set_unrestricted(P::make_shared_address(addr), flags);
     }
 
     /// Sets the private encryption state on a PTE.
     fn make_pte_private(entry: &mut PTEntry) {
         let flags = entry.flags();
         let addr = entry.address();
-        entry.set(P::make_private_address(addr), flags);
+        entry.set_unrestricted(P::make_private_address(addr), flags);
     }
 
     /// Sets the shared state for a 4KB page, splitting from 2MB if needed.
