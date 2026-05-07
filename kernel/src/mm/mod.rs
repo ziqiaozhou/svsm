@@ -27,7 +27,7 @@ pub use pagebox::*;
 pub use ptguards::*;
 
 pub use pagetable::PageTablePart;
-pub use pagetable::{KernelAllocator, KernelPageTable};
+pub use pagetable::{KernelPageTable, SvsmPTProvider};
 
 pub use alloc::{PageRef, allocate_file_page};
 

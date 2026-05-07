@@ -70,3 +70,16 @@ where
 {
     x1 <= y2 && y1 <= x2
 }
+
+/// Generates a bitmask from bit position `end` (inclusive) down to `start` (inclusive).
+///
+/// # Panics
+///
+/// Panics if `start > 63`, `end > 63`, or `start > end`.
+pub const fn bit_mask(end: u32, start: u32) -> u64 {
+    assert!(
+        start <= 63 && end <= 63 && start <= end,
+        "Start bit position must be less than or equal to end bit position"
+    );
+    ((1u64 << (end - start + 1)) - 1) << start
+}

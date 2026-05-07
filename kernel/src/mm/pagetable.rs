@@ -29,7 +29,8 @@ use zerocopy::FromZeros;
 
 // Re-export types from the paging crate.
 pub use paging::pagetable::{
-    ENTRY_COUNT, FrameAllocator, PTEntryFlags, PageTableFrameMapping, PagingMode,
+    ENTRY_COUNT, PTEntryFlags, PageEncryptionMasks, PageTableFrameAllocator, PageTableFrameMapping,
+    PageTableOps, PageTableProvider, PagingMode, SelfMap,
 };
 
 /// Mask for private page table entry.
@@ -1230,20 +1231,42 @@ impl PageTable {
     }
 }
 
-/// The kernel's frame allocator for page tables.
+/// The SVSM page table provider: frame mapping, allocation, and encryption masks.
 #[derive(Debug, Clone, Copy)]
-pub struct KernelAllocator;
+pub struct SvsmPTProvider;
 
 // SAFETY: phys_to_virt with stripped confidentiality bits correctly maps
 // the physical address to a valid virtual address in the kernel.
-unsafe impl PageTableFrameMapping for KernelAllocator {
+unsafe impl PageTableFrameMapping for SvsmPTProvider {
     fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr {
         phys_to_virt(strip_confidentiality_bits(paddr))
     }
 }
 
+impl PageEncryptionMasks for SvsmPTProvider {
+    fn private_pte_mask() -> usize {
+        private_pte_mask()
+    }
+
+    fn shared_pte_mask() -> usize {
+        shared_pte_mask()
+    }
+}
+
+impl SelfMap for SvsmPTProvider {
+    fn pte_base() -> VirtAddr {
+        SVSM_PTE_BASE
+    }
+}
+
+impl PageTableOps for SvsmPTProvider {
+    fn flush_tlb_global() {
+        flush_tlb_global_sync();
+    }
+}
+
 // SAFETY: allocate_frame returns unique zeroed frames via PageBox.
-unsafe impl FrameAllocator for KernelAllocator {
+unsafe impl PageTableFrameAllocator for SvsmPTProvider {
     type Error = SvsmError;
 
     fn allocate_frame(&mut self) -> Result<PhysAddr, SvsmError> {
@@ -1265,7 +1288,7 @@ unsafe impl FrameAllocator for KernelAllocator {
 }
 
 /// Kernel page table type alias using the generic paging crate PageTable.
-pub type KernelPageTable = paging::PageTable<KernelAllocator>;
+pub type KernelPageTable = paging::PageTable<SvsmPTProvider>;
 
 /// Represents a sub-tree of a page-table which can be mapped at a top-level index
 #[derive(Debug, FromZeros)]

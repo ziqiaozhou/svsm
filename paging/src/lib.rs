@@ -16,12 +16,13 @@ pub mod util;
 
 pub use address::{Address, PhysAddr, VirtAddr};
 pub use pagetable::{
-    ENTRY_COUNT, FrameAllocator, Mapping, PTEntry, PTEntryFlags, PTPage, PageFrame, PageTable,
-    PageTableFrameMapping, PagingMode,
+    ENTRY_COUNT, Mapping, PTEntry, PTEntryFlags, PTPage, PageEncryptionMasks, PageFrame, PageTable,
+    PageTableFrameAllocator, PageTableFrameMapping, PageTableOps, PageTableProvider, PagingMode,
+    SelfMap,
 };
 pub use types::{
     PAGE_SHIFT, PAGE_SHIFT_1G, PAGE_SHIFT_2M, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize,
 };
 pub use util::{
-    align_down, align_up, is_aligned, overlap, page_align_up, page_offset, round_to_pages,
+    align_down, align_up, bit_mask, is_aligned, overlap, page_align_up, page_offset, round_to_pages,
 };

@@ -12,6 +12,7 @@
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::types::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
+use crate::util::bit_mask;
 use bitflags::bitflags;
 use core::ops::{Index, IndexMut};
 use registers::{CR0Flags, CR4Flags, EFERFlags};
@@ -36,13 +37,105 @@ pub unsafe trait PageTableFrameMapping {
 ///
 /// Implementer must guarantee that `allocate_frame` returns unique, zeroed
 /// frames suitable as page table pages.
-pub unsafe trait FrameAllocator {
+pub unsafe trait PageTableFrameAllocator {
     type Error;
     fn allocate_frame(&mut self) -> Result<PhysAddr, Self::Error>;
     /// # Safety
     ///
     /// `paddr` must have been returned by `allocate_frame` and not yet freed.
     unsafe fn deallocate_frame(&mut self, paddr: PhysAddr);
+}
+
+/// Trait for platform-specific page encryption/confidentiality handling.
+///
+/// Provides the encryption masks used by confidential computing platforms
+/// (e.g., AMD SEV-SNP C-bit) to mark page table entries as private or shared.
+/// Only `private_pte_mask` and `shared_pte_mask` must be implemented;
+/// the remaining methods have default implementations derived from those.
+pub trait PageEncryptionMasks {
+    /// Returns the mask to apply for private (encrypted) page table entries.
+    fn private_pte_mask() -> usize;
+
+    /// Returns the mask to apply for shared (unencrypted) page table entries.
+    fn shared_pte_mask() -> usize;
+
+    /// Strips the private encryption bit(s) from a physical address.
+    fn strip_confidentiality_bits(paddr: PhysAddr) -> PhysAddr {
+        (paddr.bits() & !Self::private_pte_mask()).into()
+    }
+
+    /// Strips the shared bit(s) from a physical address.
+    fn strip_shared_address_bits(paddr: PhysAddr) -> PhysAddr {
+        (paddr.bits() & !Self::shared_pte_mask()).into()
+    }
+
+    /// Sets the private encryption mask on a physical address,
+    /// first stripping any shared bits.
+    fn make_private_address(paddr: PhysAddr) -> PhysAddr {
+        (Self::strip_shared_address_bits(paddr).bits() | Self::private_pte_mask()).into()
+    }
+
+    /// Sets the shared mask on a physical address,
+    /// first stripping any confidentiality bits.
+    fn make_shared_address(paddr: PhysAddr) -> PhysAddr {
+        (Self::strip_confidentiality_bits(paddr).bits() | Self::shared_pte_mask()).into()
+    }
+
+    /// Returns true if the address has the shared mask applied.
+    fn is_shared_address(paddr: PhysAddr) -> bool {
+        paddr == Self::make_shared_address(paddr)
+    }
+}
+
+/// A no-op implementation for environments without page encryption.
+impl PageEncryptionMasks for () {
+    fn private_pte_mask() -> usize {
+        0
+    }
+    fn shared_pte_mask() -> usize {
+        0
+    }
+}
+
+/// Combined supertrait for all page table provider capabilities:
+/// frame mapping, frame allocation, and encryption mask handling.
+///
+/// # Safety
+///
+/// Implementers must satisfy the safety requirements of both
+/// [`PageTableFrameMapping`] and [`PageTableFrameAllocator`].
+pub unsafe trait PageTableProvider:
+    PageTableFrameMapping + PageTableFrameAllocator + PageEncryptionMasks
+{
+}
+
+// Blanket implementation: any type implementing all three traits
+// automatically implements PageTableProvider.
+// SAFETY: The safety invariants are upheld by the underlying trait impls.
+unsafe impl<T: PageTableFrameMapping + PageTableFrameAllocator + PageEncryptionMasks>
+    PageTableProvider for T
+{
+}
+
+/// Trait for providers that support self-mapped page tables.
+///
+/// When a page table is loaded into CR3 with a self-map entry installed,
+/// the hardware provides a virtual address window through which all PTEs
+/// of the active page table can be read directly. This trait provides the
+/// base address of that window.
+pub trait SelfMap: PageEncryptionMasks {
+    /// Returns the virtual base address of the PTE self-map region.
+    fn pte_base() -> VirtAddr;
+}
+
+/// Trait for providers that support TLB flush operations.
+///
+/// Required for page table operations that modify existing mappings
+/// (e.g., splitting huge pages) where stale TLB entries could cause
+/// correctness issues.
+pub trait PageTableOps: PageTableProvider {
+    /// Flush the TLB globally and synchronize across all CPUs.
+    fn flush_tlb_global();
 }
 
 bitflags! {
@@ -188,6 +281,121 @@ impl PTEntry {
         PhysAddr::from(self.raw() & 0x000f_ffff_ffff_f000)
     }
 
+    /// Get the address from the page table entry, stripping private
+    /// encryption bits. The result still includes shared bits.
+    pub fn page_frame<E: PageEncryptionMasks>(&self) -> PhysAddr {
+        let addr = PhysAddr::from(self.0.bits() & 0x000f_ffff_ffff_f000);
+        E::strip_confidentiality_bits(addr)
+    }
+
+    /// Get the address from the page table entry, stripping both
+    /// private and shared bits.
+    pub fn clean_address<E: PageEncryptionMasks>(&self) -> PhysAddr {
+        E::strip_shared_address_bits(self.page_frame::<E>())
+    }
+
+    /// Set the page table entry with the specified address and flags,
+    /// filtering flags through the given feature mask.
+    pub fn set_with_feature_mask(
+        &mut self,
+        addr: PhysAddr,
+        flags: PTEntryFlags,
+        feature_mask: PTEntryFlags,
+    ) {
+        self.set(addr, flags & feature_mask);
+    }
+
+    /// Check if the page table entry has reserved bits set.
+    pub fn has_reserved_bits<E: PageEncryptionMasks>(
+        &self,
+        pm: PagingMode,
+        level: usize,
+        phys_addr_size: u32,
+    ) -> bool {
+        let reserved_mask = match pm {
+            PagingMode::NoPaging => unreachable!("NoPaging does not have page table"),
+            PagingMode::NonPAE => {
+                match level {
+                    // No reserved bits in 4k PTE.
+                    0 => 0,
+                    1 => {
+                        if self.huge() {
+                            // Bit21 is reserved in 4M PDE.
+                            bit_mask(21, 21)
+                        } else {
+                            0
+                        }
+                    }
+                    _ => unreachable!("Invalid NonPAE page table level"),
+                }
+            }
+            PagingMode::PAE => {
+                // Bit62 ~ MAXPHYSADDR are reserved for each
+                // level in PAE page table.
+                bit_mask(62, phys_addr_size)
+                    | match level {
+                        0 => 0,
+                        1 => {
+                            if self.huge() {
+                                // Bit20 ~ Bit13 are reserved in 2M PDE.
+                                bit_mask(20, 13)
+                            } else {
+                                0
+                            }
+                        }
+                        // Bit63 and Bit8 ~ Bit5 are reserved in PDPTE.
+                        2 => bit_mask(63, 63) | bit_mask(8, 5),
+                        _ => unreachable!("Invalid PAE page table level"),
+                    }
+            }
+            PagingMode::PML4 | PagingMode::PML5 => {
+                // Bit51 ~ MAXPHYSADDR are reserved for each level
+                // in PML4 and PML5 page table.
+                let common = if phys_addr_size > 51 {
+                    0
+                } else {
+                    // Remove the encryption mask bit as this bit is not reserved
+                    bit_mask(51, phys_addr_size)
+                        & !((E::shared_pte_mask() | E::private_pte_mask()) as u64)
+                };
+
+                common
+                    | match level {
+                        0 => 0,
+                        1 => {
+                            if self.huge() {
+                                // Bit20 ~ Bit13 are reserved in 2M PDE.
+                                bit_mask(20, 13)
+                            } else {
+                                0
+                            }
+                        }
+                        2 => {
+                            if self.huge() {
+                                // Bit29 ~ Bit13 are reserved in 1G PDPTE.
+                                bit_mask(29, 13)
+                            } else {
+                                0
+                            }
+                        }
+                        // Bit8 ~ Bit7 are reserved in PML4E.
+                        3 => bit_mask(8, 7),
+                        4 => {
+                            if pm == PagingMode::PML4 {
+                                unreachable!("Invalid PML4 page table level");
+                            } else {
+                                // Bit8 ~ Bit7 are reserved in PML5E.
+                                bit_mask(8, 7)
+                            }
+                        }
+                        _ => unreachable!("Invalid PML4/PML5 page table level"),
+                    }
+            }
+        };
+
+        self.raw() & reserved_mask != 0
+    }
+
     /// Read a page table entry from the specified virtual address.
     ///
     /// # Safety
@@ -301,22 +509,22 @@ impl PageFrame {
 }
 
 /// Page table structure containing a root page with multiple entries.
-/// Generic over the allocator/mapping implementation.
+/// Generic over the page table provider implementation.
 #[repr(C)]
 #[derive(Debug)]
-pub struct PageTable<A: PageTableFrameMapping + FrameAllocator> {
+pub struct PageTable<P: PageTableProvider> {
     root: PTPage,
-    alloc: A,
+    provider: P,
 }
 
-impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
-    /// Create a new page table with zeroed root and the given allocator.
-    pub fn new(alloc: A) -> Self {
+impl<P: PageTableProvider> PageTable<P> {
+    /// Create a new page table with zeroed root and the given provider.
+    pub fn new(provider: P) -> Self {
         Self {
             root: PTPage {
                 entries: [PTEntry(PhysAddr::null()); ENTRY_COUNT],
             },
-            alloc,
+            provider,
         }
     }
 
@@ -330,14 +538,14 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
         &mut self.root
     }
 
-    /// Get a reference to the allocator.
-    pub fn alloc(&self) -> &A {
-        &self.alloc
+    /// Get a reference to the provider.
+    pub fn provider(&self) -> &P {
+        &self.provider
     }
 
-    /// Get a mutable reference to the allocator.
-    pub fn alloc_mut(&mut self) -> &mut A {
-        &mut self.alloc
+    /// Get a mutable reference to the provider.
+    pub fn provider_mut(&mut self) -> &mut P {
+        &mut self.provider
     }
 
     /// Computes the index within a page table at the given level for a
@@ -353,34 +561,34 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
 
     /// Walk the virtual address and return the corresponding mapping.
     pub fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
-        Self::walk_addr_lvl3(&mut self.root, &self.alloc, vaddr)
+        Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr)
     }
 
     /// Walks the page table at level 3.
-    pub fn walk_addr_lvl3<'a>(page: &'a mut PTPage, alloc: &A, vaddr: VirtAddr) -> Mapping<'a> {
+    pub fn walk_addr_lvl3<'a>(page: &'a mut PTPage, provider: &P, vaddr: VirtAddr) -> Mapping<'a> {
         let idx = Self::index::<3>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry, alloc) {
-            Some(page) => Self::walk_addr_lvl2(page, alloc, vaddr),
+        match PTPage::from_entry(entry, provider) {
+            Some(page) => Self::walk_addr_lvl2(page, provider, vaddr),
             None => Mapping::Level3(&mut page[idx]),
         }
     }
 
     /// Walks the page table at level 2.
-    pub fn walk_addr_lvl2<'a>(page: &'a mut PTPage, alloc: &A, vaddr: VirtAddr) -> Mapping<'a> {
+    pub fn walk_addr_lvl2<'a>(page: &'a mut PTPage, provider: &P, vaddr: VirtAddr) -> Mapping<'a> {
         let idx = Self::index::<2>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry, alloc) {
-            Some(page) => Self::walk_addr_lvl1(page, alloc, vaddr),
+        match PTPage::from_entry(entry, provider) {
+            Some(page) => Self::walk_addr_lvl1(page, provider, vaddr),
             None => Mapping::Level2(&mut page[idx]),
         }
     }
 
     /// Walks the page table at level 1.
-    pub fn walk_addr_lvl1<'a>(page: &'a mut PTPage, alloc: &A, vaddr: VirtAddr) -> Mapping<'a> {
+    pub fn walk_addr_lvl1<'a>(page: &'a mut PTPage, provider: &P, vaddr: VirtAddr) -> Mapping<'a> {
         let idx = Self::index::<1>(vaddr);
         let entry = page[idx];
-        match PTPage::from_entry(entry, alloc) {
+        match PTPage::from_entry(entry, provider) {
             Some(page) => Self::walk_addr_lvl0(page, vaddr),
             None => Mapping::Level1(&mut page[idx]),
         }
@@ -394,34 +602,34 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
 
     /// Allocates page table levels down to a 4KB PTE.
     pub fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
-        let m = Self::walk_addr_lvl3(&mut self.root, &self.alloc, vaddr);
+        let m = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr);
 
         match m {
             Mapping::Level0(entry) => Mapping::Level0(entry),
             Mapping::Level1(entry) => {
-                Self::alloc_pte_lvl1(entry, vaddr, PageSize::Regular, &mut self.alloc)
+                Self::alloc_pte_lvl1(entry, vaddr, PageSize::Regular, &mut self.provider)
             }
             Mapping::Level2(entry) => {
-                Self::alloc_pte_lvl2(entry, vaddr, PageSize::Regular, &mut self.alloc)
+                Self::alloc_pte_lvl2(entry, vaddr, PageSize::Regular, &mut self.provider)
             }
             Mapping::Level3(entry) => {
-                Self::alloc_pte_lvl3(entry, vaddr, PageSize::Regular, &mut self.alloc)
+                Self::alloc_pte_lvl3(entry, vaddr, PageSize::Regular, &mut self.provider)
             }
         }
     }
 
     /// Allocates page table levels down to a 2MB PTE.
     pub fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_> {
-        let m = Self::walk_addr_lvl3(&mut self.root, &self.alloc, vaddr);
+        let m = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr);
 
         match m {
             Mapping::Level0(entry) => Mapping::Level0(entry),
             Mapping::Level1(entry) => Mapping::Level1(entry),
             Mapping::Level2(entry) => {
-                Self::alloc_pte_lvl2(entry, vaddr, PageSize::Huge, &mut self.alloc)
+                Self::alloc_pte_lvl2(entry, vaddr, PageSize::Huge, &mut self.provider)
             }
             Mapping::Level3(entry) => {
-                Self::alloc_pte_lvl3(entry, vaddr, PageSize::Huge, &mut self.alloc)
+                Self::alloc_pte_lvl3(entry, vaddr, PageSize::Huge, &mut self.provider)
             }
         }
     }
@@ -431,7 +639,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
         entry: &'a mut PTEntry,
         vaddr: VirtAddr,
         size: PageSize,
-        alloc: &mut A,
+        provider: &mut P,
     ) -> Mapping<'a> {
         let flags = entry.flags();
 
@@ -439,7 +647,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
             return Mapping::Level3(entry);
         }
 
-        let Ok(paddr) = alloc.allocate_frame() else {
+        let Ok(paddr) = provider.allocate_frame() else {
             return Mapping::Level3(entry);
         };
 
@@ -449,12 +657,12 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
             | PTEntryFlags::ACCESSED;
         entry.set(paddr, flags);
 
-        let vaddr_page = alloc.paddr_to_vaddr(entry.address());
+        let vaddr_page = provider.paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
         let page = unsafe { PTPage::from_vaddr(vaddr_page) };
 
         let idx = Self::index::<2>(vaddr);
-        Self::alloc_pte_lvl2(&mut page[idx], vaddr, size, alloc)
+        Self::alloc_pte_lvl2(&mut page[idx], vaddr, size, provider)
     }
 
     /// Allocate at level 2, descend to level 1.
@@ -462,7 +670,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
         entry: &'a mut PTEntry,
         vaddr: VirtAddr,
         size: PageSize,
-        alloc: &mut A,
+        provider: &mut P,
     ) -> Mapping<'a> {
         let flags = entry.flags();
 
@@ -470,7 +678,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
             return Mapping::Level2(entry);
         }
 
-        let Ok(paddr) = alloc.allocate_frame() else {
+        let Ok(paddr) = provider.allocate_frame() else {
             return Mapping::Level2(entry);
         };
 
@@ -480,12 +688,12 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
             | PTEntryFlags::ACCESSED;
         entry.set(paddr, flags);
 
-        let vaddr_page = alloc.paddr_to_vaddr(entry.address());
+        let vaddr_page = provider.paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
         let page = unsafe { PTPage::from_vaddr(vaddr_page) };
 
         let idx = Self::index::<1>(vaddr);
-        Self::alloc_pte_lvl1(&mut page[idx], vaddr, size, alloc)
+        Self::alloc_pte_lvl1(&mut page[idx], vaddr, size, provider)
     }
 
     /// Allocate at level 1, descend to level 0.
@@ -493,7 +701,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
         entry: &'a mut PTEntry,
         vaddr: VirtAddr,
         size: PageSize,
-        alloc: &mut A,
+        provider: &mut P,
     ) -> Mapping<'a> {
         let flags = entry.flags();
 
@@ -501,7 +709,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
             return Mapping::Level1(entry);
         }
 
-        let Ok(paddr) = alloc.allocate_frame() else {
+        let Ok(paddr) = provider.allocate_frame() else {
             return Mapping::Level1(entry);
         };
 
@@ -511,7 +719,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
             | PTEntryFlags::ACCESSED;
         entry.set(paddr, flags);
 
-        let vaddr_page = alloc.paddr_to_vaddr(entry.address());
+        let vaddr_page = provider.paddr_to_vaddr(entry.address());
         // SAFETY: We just allocated a zeroed frame at this address.
         let page = unsafe { PTPage::from_vaddr(vaddr_page) };
 
@@ -525,7 +733,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
         vaddr: VirtAddr,
         paddr: PhysAddr,
         flags: PTEntryFlags,
-    ) -> Result<(), A::Error> {
+    ) -> Result<(), P::Error> {
         let mapping = self.alloc_pte_4k(vaddr);
 
         match mapping {
@@ -535,8 +743,8 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
             }
             _ => {
                 // Allocation failed — we need an error. Since we can't create
-                // A::Error generically, attempt one more allocation to get the error.
-                Err(self.alloc.allocate_frame().unwrap_err())
+                // P::Error generically, attempt one more allocation to get the error.
+                Err(self.provider.allocate_frame().unwrap_err())
             }
         }
     }
@@ -547,7 +755,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
         vaddr: VirtAddr,
         paddr: PhysAddr,
         flags: PTEntryFlags,
-    ) -> Result<(), A::Error> {
+    ) -> Result<(), P::Error> {
         assert!(vaddr.is_aligned(PAGE_SIZE_2M));
         assert!(paddr.is_aligned(PAGE_SIZE_2M));
 
@@ -558,7 +766,7 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
                 entry.set(paddr, flags | PTEntryFlags::HUGE);
                 Ok(())
             }
-            _ => Err(self.alloc.allocate_frame().unwrap_err()),
+            _ => Err(self.provider.allocate_frame().unwrap_err()),
         }
     }
 
@@ -620,6 +828,188 @@ impl<A: PageTableFrameMapping + FrameAllocator> PageTable<A> {
                 Some(entry.address() + offset)
             }
             Mapping::Level2(_) | Mapping::Level3(_) => None,
+        }
+    }
+
+    /// Maps a 4KB page with encryption-aware address handling.
+    ///
+    /// When `shared` is true, the shared mask is applied; otherwise
+    /// the private mask is applied.
+    pub fn map_4k_encrypted(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: PTEntryFlags,
+        shared: bool,
+    ) -> Result<(), P::Error> {
+        let addr = if shared {
+            P::make_shared_address(paddr)
+        } else {
+            P::make_private_address(paddr)
+        };
+        self.map_4k(vaddr, addr, flags)
+    }
+
+    /// Maps a 2MB page with encryption-aware address handling.
+    ///
+    /// When `shared` is true, the shared mask is applied; otherwise
+    /// the private mask is applied.
+    pub fn map_2m_encrypted(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: PTEntryFlags,
+        shared: bool,
+    ) -> Result<(), P::Error> {
+        let addr = if shared {
+            P::make_shared_address(paddr)
+        } else {
+            P::make_private_address(paddr)
+        };
+        self.map_2m(vaddr, addr, flags)
+    }
+}
+
+/// Methods requiring TLB flush support (splitting, encryption changes).
+impl<P: PageTableOps> PageTable<P> {
+    /// Splits a 2MB page into 4KB pages.
+    fn do_split_4k(provider: &mut P, entry: &mut PTEntry) -> Result<(), P::Error> {
+        let paddr = provider.allocate_frame()?;
+        let vaddr_page = provider.paddr_to_vaddr(paddr);
+        // SAFETY: We just allocated a zeroed frame at this address.
+        let page = unsafe { PTPage::from_vaddr(vaddr_page) };
+
+        let mut flags = entry.flags();
+        assert!(flags.contains(PTEntryFlags::HUGE));
+
+        let addr_2m = entry.clean_address::<P>();
+        let addr_2m = PhysAddr::from(addr_2m.bits() & 0x000f_ffff_fff0_0000);
+
+        flags.remove(PTEntryFlags::HUGE);
+
+        // Prepare PTE leaf page
+        for (i, e) in page.entries.iter_mut().enumerate() {
+            let addr_4k = addr_2m + (i * PAGE_SIZE);
+            e.clear();
+            e.set(P::make_private_address(addr_4k), flags);
+        }
+
+        entry.set(P::make_private_address(paddr), flags);
+
+        P::flush_tlb_global();
+
+        Ok(())
+    }
+
+    /// Sets the shared encryption state on a PTE.
+    fn make_pte_shared(entry: &mut PTEntry) {
+        let flags = entry.flags();
+        let addr = entry.address();
+        entry.set(P::make_shared_address(addr), flags);
+    }
+
+    /// Sets the private encryption state on a PTE.
+    fn make_pte_private(entry: &mut PTEntry) {
+        let flags = entry.flags();
+        let addr = entry.address();
+        entry.set(P::make_private_address(addr), flags);
+    }
+
+    /// Sets the shared state for a 4KB page, splitting from 2MB if needed.
+    pub fn set_shared_4k(&mut self, vaddr: VirtAddr) -> Result<(), P::Error> {
+        if let Mapping::Level1(entry) = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr)
+        {
+            Self::do_split_4k(&mut self.provider, entry)?;
+        }
+
+        if let Mapping::Level0(entry) = self.walk_addr(vaddr) {
+            Self::make_pte_shared(entry);
+            Ok(())
+        } else {
+            Err(self.provider.allocate_frame().unwrap_err())
+        }
+    }
+
+    /// Sets the private (encrypted) state for a 4KB page, splitting from 2MB if needed.
+    pub fn set_encrypted_4k(&mut self, vaddr: VirtAddr) -> Result<(), P::Error> {
+        if let Mapping::Level1(entry) = Self::walk_addr_lvl3(&mut self.root, &self.provider, vaddr)
+        {
+            Self::do_split_4k(&mut self.provider, entry)?;
+        }
+
+        if let Mapping::Level0(entry) = self.walk_addr(vaddr) {
+            Self::make_pte_private(entry);
+            Ok(())
+        } else {
+            Err(self.provider.allocate_frame().unwrap_err())
+        }
+    }
+}
+
+/// Methods available only when the provider supports self-mapped page tables.
+impl<P: PageTableProvider + SelfMap> PageTable<P> {
+    /// Compute the virtual address of the PTE that maps `vaddr`,
+    /// using the self-map region of the currently active page table.
+    fn get_pte_address(vaddr: VirtAddr) -> VirtAddr {
+        P::pte_base() + ((usize::from(vaddr) & 0x0000_FFFF_FFFF_F000) >> 9)
+    }
+
+    /// Perform a virtual-to-physical translation using the self-map
+    /// of the currently active page table (loaded in CR3).
+    ///
+    /// Returns `Some(PageFrame)` if the virtual address is mapped,
+    /// `None` otherwise.
+    ///
+    /// # Safety context
+    ///
+    /// This reads PTEs from the self-map addresses of the **currently loaded**
+    /// page table. The caller must ensure that the active page table has a
+    /// valid self-map entry installed.
+    pub fn virt_to_frame(vaddr: VirtAddr) -> Option<PageFrame> {
+        let pte_addr = Self::get_pte_address(vaddr);
+        let pde_addr = Self::get_pte_address(pte_addr);
+        let pdpe_addr = Self::get_pte_address(pde_addr);
+        let pml4e_addr = Self::get_pte_address(pdpe_addr);
+
+        // SAFETY: Reading PTE hierarchy top-down through self-map addresses.
+        // Each level is checked for presence before reading the next.
+        let pml4e = unsafe { PTEntry::read_pte(pml4e_addr) };
+        if !pml4e.present() {
+            return None;
+        }
+
+        // SAFETY: The PML4E was checked to be present, so the PDPE exists
+        // and can be read safely via the self-map.
+        let pdpe = unsafe { PTEntry::read_pte(pdpe_addr) };
+        if !pdpe.present() {
+            return None;
+        }
+        if pdpe.huge() {
+            let pa =
+                P::strip_confidentiality_bits(pdpe.address()) + (usize::from(vaddr) & 0x3FFF_FFFF);
+            return Some(PageFrame::Size1G(pa));
+        }
+
+        // SAFETY: The PDPE was checked to be present and not huge,
+        // so the PDE exists and can be read safely via the self-map.
+        let pde = unsafe { PTEntry::read_pte(pde_addr) };
+        if !pde.present() {
+            return None;
+        }
+        if pde.huge() {
+            let pa =
+                P::strip_confidentiality_bits(pde.address()) + (usize::from(vaddr) & 0x001F_FFFF);
+            return Some(PageFrame::Size2M(pa));
+        }
+
+        // SAFETY: The PDE was checked to be present and not huge,
+        // so the PTE exists and can be read safely via the self-map.
+        let pte = unsafe { PTEntry::read_pte(pte_addr) };
+        if pte.present() {
+            let pa = P::strip_confidentiality_bits(pte.address()) + (usize::from(vaddr) & 0xFFF);
+            Some(PageFrame::Size4K(pa))
+        } else {
+            None
         }
     }
 }
