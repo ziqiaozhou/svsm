@@ -454,12 +454,12 @@ impl PageFrame {
 /// Generic over the page table provider implementation.
 #[repr(C)]
 #[derive(Debug)]
-pub struct PageTable<P: PagingHandler> {
+pub struct GenericPageTable<P: PagingHandler> {
     root: PTPage<P>,
     provider: P,
 }
 
-impl<P: PagingHandler> PageTable<P> {
+impl<P: PagingHandler> GenericPageTable<P> {
     /// Create a new page table with zeroed root and the given provider.
     pub fn new(provider: P) -> Self {
         Self {
@@ -499,7 +499,7 @@ impl<P: PagingHandler> PageTable<P> {
         vaddr.to_pgtbl_idx::<L>()
     }
 
-    /// Copy an entry `entry` from another [`PageTable`].
+    /// Copy an entry `entry` from another [`GenericPageTable`].
     pub fn copy_entry(&mut self, other: &Self, entry: usize) {
         self.root.entries[entry] = other.root.entries[entry];
     }
@@ -828,7 +828,7 @@ impl<P: PagingHandler> PageTable<P> {
 }
 
 /// Methods requiring TLB flush support (splitting, encryption changes).
-impl<P: PagingHandler> PageTable<P> {
+impl<P: PagingHandler> GenericPageTable<P> {
     /// Splits a 2MB page into 4KB pages.
     fn do_split_4k(provider: &mut P, entry: &mut PTEntry<P>) -> Result<(), P::Error> {
         let paddr = provider.allocate_frame()?;
@@ -904,7 +904,7 @@ impl<P: PagingHandler> PageTable<P> {
 }
 
 /// Methods available only when the provider supports self-mapped page tables.
-impl<P: PagingHandler + SelfMap> PageTable<P> {
+impl<P: PagingHandler + SelfMap> GenericPageTable<P> {
     /// Compute the virtual address of the PTE that maps `vaddr`,
     /// using the self-map region of the currently active page table.
     fn get_pte_address(vaddr: VirtAddr) -> VirtAddr {

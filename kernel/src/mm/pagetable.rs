@@ -1069,8 +1069,8 @@ impl SelfMap for SvsmPTProvider {
     }
 }
 
-/// Kernel page table type alias using the generic paging crate PageTable.
-pub type KernelPageTable = paging::PageTable<SvsmPTProvider>;
+/// Kernel page table type alias using the generic paging crate GenericPageTable.
+pub type KernelPageTable = paging::GenericPageTable<SvsmPTProvider>;
 
 /// Extension trait for [`PageFrame`] that applies SVSM encryption masks.
 pub trait SvsmPageFrameExt {
