@@ -17,7 +17,7 @@ use crate::mm::{
     virt_to_phys,
 };
 use crate::platform::SvsmPlatform;
-use crate::types::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
+use crate::types::{PAGE_SIZE, PAGE_SIZE_2M, PageSize};
 use crate::utils::MemoryRegion;
 use crate::utils::immut_after_init::{ImmutAfterInitCell, ImmutAfterInitResult};
 use bitflags::bitflags;
@@ -29,8 +29,8 @@ use zerocopy::FromZeros;
 
 // Re-export types from the paging crate.
 pub use paging::pagetable::{
-    ENTRY_COUNT, PTEntryFlags, PageEncryptionMasks, PageTableFrameAllocator, PageTableFrameMapping,
-    PageTableOps, PageTableProvider, PagingMode, SelfMap,
+    ENTRY_COUNT, PTEntryFlags, PageEncryptionMasks, PageFrame, PageTableFrameAllocator,
+    PageTableFrameMapping, PageTableOps, PageTableProvider, PagingMode, SelfMap,
 };
 
 /// Mask for private page table entry.
@@ -418,48 +418,6 @@ pub enum Mapping<'a> {
     Level2(&'a mut PTEntry),
     Level1(&'a mut PTEntry),
     Level0(&'a mut PTEntry),
-}
-
-/// A physical address within a page frame
-#[derive(Clone, Copy, Debug)]
-pub enum PageFrame {
-    Size4K(PhysAddr),
-    Size2M(PhysAddr),
-    Size1G(PhysAddr),
-}
-
-impl PageFrame {
-    /// Get the address from the page frame, including the shared bit.
-    pub fn page_frame(&self) -> PhysAddr {
-        let paddr = match *self {
-            Self::Size4K(pa) => pa,
-            Self::Size2M(pa) => pa,
-            Self::Size1G(pa) => pa,
-        };
-        strip_confidentiality_bits(paddr)
-    }
-
-    /// Get the address from the page frame, excluding the C/shared bit.
-    pub fn address(&self) -> PhysAddr {
-        strip_shared_address_bits(self.page_frame())
-    }
-
-    pub fn size(&self) -> usize {
-        match self {
-            Self::Size4K(_) => PAGE_SIZE,
-            Self::Size2M(_) => PAGE_SIZE_2M,
-            Self::Size1G(_) => PAGE_SIZE_1G,
-        }
-    }
-
-    pub fn start(&self) -> PhysAddr {
-        let end = self.address().bits() & !(self.size() - 1);
-        end.into()
-    }
-
-    pub fn end(&self) -> PhysAddr {
-        self.start() + self.size()
-    }
 }
 
 /// Page table structure containing a root page with multiple entries.
@@ -1289,6 +1247,24 @@ unsafe impl PageTableFrameAllocator for SvsmPTProvider {
 
 /// Kernel page table type alias using the generic paging crate PageTable.
 pub type KernelPageTable = paging::PageTable<SvsmPTProvider>;
+
+/// Extension trait for [`PageFrame`] that applies SVSM encryption masks.
+pub trait SvsmPageFrameExt {
+    /// Get the address with confidentiality bits stripped (shared bit kept).
+    fn page_frame(&self) -> PhysAddr;
+    /// Get the clean address with both confidentiality and shared bits stripped.
+    fn clean_address(&self) -> PhysAddr;
+}
+
+impl SvsmPageFrameExt for PageFrame {
+    fn page_frame(&self) -> PhysAddr {
+        SvsmPTProvider::strip_confidentiality_bits(self.address())
+    }
+
+    fn clean_address(&self) -> PhysAddr {
+        SvsmPTProvider::strip_shared_address_bits(self.page_frame())
+    }
+}
 
 /// Represents a sub-tree of a page-table which can be mapped at a top-level index
 #[derive(Debug, FromZeros)]
