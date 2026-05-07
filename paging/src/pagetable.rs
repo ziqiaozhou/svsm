@@ -27,11 +27,18 @@ pub const ENTRY_COUNT: usize = 512;
 /// Only `private_pte_mask` and `shared_pte_mask` must be implemented;
 /// the remaining methods have default implementations derived from those.
 pub trait PagingArchHandler {
+    // --- Required methods ---
+
     /// Returns the mask to apply for private (encrypted) page table entries.
     fn private_pte_mask() -> usize;
 
     /// Returns the mask to apply for shared (unencrypted) page table entries.
     fn shared_pte_mask() -> usize;
+
+    /// Flush the TLB globally and synchronize across all CPUs.
+    fn flush_tlb_global();
+
+    // --- Default methods (derived from the masks above) ---
 
     /// Strips the private encryption bit(s) from a physical address.
     fn strip_confidentiality_bits(paddr: PhysAddr) -> PhysAddr {
@@ -59,13 +66,6 @@ pub trait PagingArchHandler {
     fn is_shared_address(paddr: PhysAddr) -> bool {
         paddr == Self::make_shared_address(paddr)
     }
-
-    /// Flush the TLB globally and synchronize across all CPUs.
-    ///
-    /// Required for page table operations that modify existing mappings
-    /// (e.g., splitting huge pages) where stale TLB entries could cause
-    /// correctness issues.
-    fn flush_tlb_global();
 }
 
 /// OS-dependent page table provider: physical-to-virtual mapping and
