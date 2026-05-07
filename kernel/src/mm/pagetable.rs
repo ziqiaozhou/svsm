@@ -29,8 +29,7 @@ use zerocopy::FromZeros;
 
 // Re-export types from the paging crate.
 pub use paging::pagetable::{
-    ENTRY_COUNT, PTEntryFlags, PageEncryptionMasks, PageFrame, PageTableFrameAllocator,
-    PageTableFrameMapping, PageTableOps, PageTableProvider, PagingMode, SelfMap,
+    ENTRY_COUNT, PTEntryFlags, PageFrame, PageTableOps, PagingHandler, PagingMode, SelfMap,
 };
 
 /// Mask for private page table entry.
@@ -1193,15 +1192,32 @@ impl PageTable {
 #[derive(Debug, Clone, Copy)]
 pub struct SvsmPTProvider;
 
-// SAFETY: phys_to_virt with stripped confidentiality bits correctly maps
-// the physical address to a valid virtual address in the kernel.
-unsafe impl PageTableFrameMapping for SvsmPTProvider {
+// SAFETY: paddr_to_vaddr correctly maps physical addresses via phys_to_virt,
+// and allocate_frame returns unique zeroed frames via PageBox.
+unsafe impl PagingHandler for SvsmPTProvider {
+    type Error = SvsmError;
+
     fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr {
         phys_to_virt(strip_confidentiality_bits(paddr))
     }
-}
 
-impl PageEncryptionMasks for SvsmPTProvider {
+    fn allocate_frame(&mut self) -> Result<PhysAddr, SvsmError> {
+        let page: PageBox<PTPage> = PageBox::try_new_zeroed()?;
+        let paddr = virt_to_phys(page.vaddr());
+        let _ = PageBox::leak(page);
+        Ok(make_private_address(paddr))
+    }
+
+    unsafe fn deallocate_frame(&mut self, paddr: PhysAddr) {
+        let vaddr = phys_to_virt(strip_confidentiality_bits(paddr));
+        // SAFETY: paddr was returned by allocate_frame (via PageBox::leak),
+        // so reconstructing the PageBox from the same pointer is valid.
+        unsafe {
+            let ptr = NonNull::new(vaddr.as_mut_ptr::<PTPage>()).unwrap();
+            let _ = PageBox::from_raw(ptr);
+        }
+    }
+
     fn private_pte_mask() -> usize {
         private_pte_mask()
     }
@@ -1220,28 +1236,6 @@ impl SelfMap for SvsmPTProvider {
 impl PageTableOps for SvsmPTProvider {
     fn flush_tlb_global() {
         flush_tlb_global_sync();
-    }
-}
-
-// SAFETY: allocate_frame returns unique zeroed frames via PageBox.
-unsafe impl PageTableFrameAllocator for SvsmPTProvider {
-    type Error = SvsmError;
-
-    fn allocate_frame(&mut self) -> Result<PhysAddr, SvsmError> {
-        let page: PageBox<PTPage> = PageBox::try_new_zeroed()?;
-        let paddr = virt_to_phys(page.vaddr());
-        let _ = PageBox::leak(page);
-        Ok(make_private_address(paddr))
-    }
-
-    unsafe fn deallocate_frame(&mut self, paddr: PhysAddr) {
-        let vaddr = phys_to_virt(strip_confidentiality_bits(paddr));
-        // SAFETY: paddr was returned by allocate_frame (via PageBox::leak),
-        // so reconstructing the PageBox from the same pointer is valid.
-        unsafe {
-            let ptr = NonNull::new(vaddr.as_mut_ptr::<PTPage>()).unwrap();
-            let _ = PageBox::from_raw(ptr);
-        }
     }
 }
 

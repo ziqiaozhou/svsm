@@ -20,38 +20,30 @@ use zerocopy::FromBytes;
 /// Number of entries in a page table (4KB/8B).
 pub const ENTRY_COUNT: usize = 512;
 
-/// Trait for translating physical addresses to virtual addresses.
+/// Combined trait for page table provider capabilities:
+/// physical-to-virtual mapping, frame allocation, and encryption mask handling.
 ///
 /// # Safety
 ///
-/// Implementer must guarantee that the returned virtual address validly
-/// maps the given physical address.
-pub unsafe trait PageTableFrameMapping {
-    fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr;
-}
-
-/// Trait for allocating and deallocating page table frames.
-///
-/// # Safety
-///
-/// Implementer must guarantee that `allocate_frame` returns unique, zeroed
-/// frames suitable as page table pages.
-pub unsafe trait PageTableFrameAllocator {
+/// Implementer must guarantee that:
+/// - `paddr_to_vaddr` returns a virtual address that validly maps the given physical address.
+/// - `allocate_frame` returns unique, zeroed frames suitable as page table pages.
+pub unsafe trait PagingHandler {
     type Error;
+
+    /// Translate a physical address to a virtual address.
+    fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr;
+
+    /// Allocate a zeroed page-table frame, returning its physical address.
     fn allocate_frame(&mut self) -> Result<PhysAddr, Self::Error>;
+
+    /// Deallocate a previously allocated page-table frame.
+    ///
     /// # Safety
     ///
     /// `paddr` must have been returned by `allocate_frame` and not yet freed.
     unsafe fn deallocate_frame(&mut self, paddr: PhysAddr);
-}
 
-/// Trait for platform-specific page encryption/confidentiality handling.
-///
-/// Provides the encryption masks used by confidential computing platforms
-/// (e.g., AMD SEV-SNP C-bit) to mark page table entries as private or shared.
-/// Only `private_pte_mask` and `shared_pte_mask` must be implemented;
-/// the remaining methods have default implementations derived from those.
-pub trait PageEncryptionMasks {
     /// Returns the mask to apply for private (encrypted) page table entries.
     fn private_pte_mask() -> usize;
 
@@ -86,36 +78,6 @@ pub trait PageEncryptionMasks {
     }
 }
 
-/// A no-op implementation for environments without page encryption.
-impl PageEncryptionMasks for () {
-    fn private_pte_mask() -> usize {
-        0
-    }
-    fn shared_pte_mask() -> usize {
-        0
-    }
-}
-
-/// Combined supertrait for all page table provider capabilities:
-/// frame mapping, frame allocation, and encryption mask handling.
-///
-/// # Safety
-///
-/// Implementers must satisfy the safety requirements of both
-/// [`PageTableFrameMapping`] and [`PageTableFrameAllocator`].
-pub unsafe trait PageTableProvider:
-    PageTableFrameMapping + PageTableFrameAllocator + PageEncryptionMasks
-{
-}
-
-// Blanket implementation: any type implementing all three traits
-// automatically implements PageTableProvider.
-// SAFETY: The safety invariants are upheld by the underlying trait impls.
-unsafe impl<T: PageTableFrameMapping + PageTableFrameAllocator + PageEncryptionMasks>
-    PageTableProvider for T
-{
-}
-
 /// Trait for providers that support self-mapped page tables.
 ///
 /// When a page table is loaded into CR3 with a self-map entry installed,
@@ -132,7 +94,7 @@ pub trait SelfMap {
 /// Required for page table operations that modify existing mappings
 /// (e.g., splitting huge pages) where stale TLB entries could cause
 /// correctness issues.
-pub trait PageTableOps: PageTableProvider {
+pub trait PageTableOps: PagingHandler {
     /// Flush the TLB globally and synchronize across all CPUs.
     fn flush_tlb_global();
 }
@@ -316,10 +278,7 @@ impl PTPage {
     /// Converts a pagetable entry to a mutable reference to a [`PTPage`],
     /// if the entry is present and not huge. Uses the provided mapping
     /// to translate the physical address.
-    pub fn from_entry<A: PageTableFrameMapping>(
-        entry: PTEntry,
-        mapping: &A,
-    ) -> Option<&'static mut Self> {
+    pub fn from_entry<A: PagingHandler>(entry: PTEntry, mapping: &A) -> Option<&'static mut Self> {
         let flags = entry.flags();
         if !flags.contains(PTEntryFlags::PRESENT) || flags.contains(PTEntryFlags::HUGE) {
             return None;
@@ -407,12 +366,12 @@ impl PageFrame {
 /// Generic over the page table provider implementation.
 #[repr(C)]
 #[derive(Debug)]
-pub struct PageTable<P: PageTableProvider> {
+pub struct PageTable<P: PagingHandler> {
     root: PTPage,
     provider: P,
 }
 
-impl<P: PageTableProvider> PageTable<P> {
+impl<P: PagingHandler> PageTable<P> {
     /// Create a new page table with zeroed root and the given provider.
     pub fn new(provider: P) -> Self {
         Self {
@@ -842,7 +801,7 @@ impl<P: PageTableOps> PageTable<P> {
 }
 
 /// Methods available only when the provider supports self-mapped page tables.
-impl<P: PageTableProvider + SelfMap> PageTable<P> {
+impl<P: PagingHandler + SelfMap> PageTable<P> {
     /// Compute the virtual address of the PTE that maps `vaddr`,
     /// using the self-map region of the currently active page table.
     fn get_pte_address(vaddr: VirtAddr) -> VirtAddr {
