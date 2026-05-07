@@ -27,8 +27,10 @@ use core::ptr::NonNull;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 
-/// Number of entries in a page table (4KB/8B).
-pub const ENTRY_COUNT: usize = 512;
+// Re-export types from the paging crate.
+pub use paging::pagetable::{
+    ENTRY_COUNT, FrameAllocator, PTEntryFlags, PageTableFrameMapping, PagingMode,
+};
 
 /// Mask for private page table entry.
 static PRIVATE_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::uninit();
@@ -129,83 +131,6 @@ fn strip_confidentiality_bits(paddr: PhysAddr) -> PhysAddr {
 
 fn strip_shared_address_bits(paddr: PhysAddr) -> PhysAddr {
     (paddr.bits() & !shared_pte_mask()).into()
-}
-
-bitflags! {
-    #[derive(Copy, Clone, Debug, Default)]
-    pub struct PTEntryFlags: u64 {
-        const PRESENT       = 1 << 0;
-        const WRITABLE      = 1 << 1;
-        const USER      = 1 << 2;
-        const ACCESSED      = 1 << 5;
-        const DIRTY     = 1 << 6;
-        const HUGE      = 1 << 7;
-        const GLOBAL        = 1 << 8;
-        const NX        = 1 << 63;
-    }
-}
-
-impl PTEntryFlags {
-    pub fn exec() -> Self {
-        Self::PRESENT | Self::GLOBAL | Self::ACCESSED
-    }
-
-    pub fn data() -> Self {
-        Self::PRESENT | Self::GLOBAL | Self::WRITABLE | Self::NX | Self::ACCESSED | Self::DIRTY
-    }
-
-    pub fn data_ro() -> Self {
-        Self::PRESENT | Self::GLOBAL | Self::NX | Self::ACCESSED
-    }
-
-    pub fn task_exec() -> Self {
-        Self::PRESENT | Self::ACCESSED
-    }
-
-    pub fn task_data() -> Self {
-        Self::PRESENT | Self::WRITABLE | Self::NX | Self::ACCESSED | Self::DIRTY
-    }
-
-    pub fn task_data_ro() -> Self {
-        Self::PRESENT | Self::NX | Self::ACCESSED
-    }
-}
-
-/// Represents paging mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PagingMode {
-    // Paging mode is disabled
-    NoPaging,
-    // 32bit legacy paging mode
-    NonPAE,
-    // 32bit PAE paging mode
-    PAE,
-    // 4 level paging mode
-    PML4,
-    // 5 level paging mode
-    PML5,
-}
-
-impl PagingMode {
-    pub fn new(efer: EFERFlags, cr0: CR0Flags, cr4: CR4Flags) -> Self {
-        if !cr0.contains(CR0Flags::PG) {
-            // Paging is disabled
-            PagingMode::NoPaging
-        } else if efer.contains(EFERFlags::LMA) {
-            // Long mode is activated
-            if cr4.contains(CR4Flags::LA57) {
-                PagingMode::PML5
-            } else {
-                PagingMode::PML4
-            }
-        } else if cr4.contains(CR4Flags::PAE) {
-            // PAE mode
-            PagingMode::PAE
-        } else {
-            // Non PAE mode
-            PagingMode::NonPAE
-        }
-    }
 }
 
 /// Represents a page table entry.
@@ -1304,6 +1229,43 @@ impl PageTable {
         Ok(())
     }
 }
+
+/// The kernel's frame allocator for page tables.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelAllocator;
+
+// SAFETY: phys_to_virt with stripped confidentiality bits correctly maps
+// the physical address to a valid virtual address in the kernel.
+unsafe impl PageTableFrameMapping for KernelAllocator {
+    fn paddr_to_vaddr(&self, paddr: PhysAddr) -> VirtAddr {
+        phys_to_virt(strip_confidentiality_bits(paddr))
+    }
+}
+
+// SAFETY: allocate_frame returns unique zeroed frames via PageBox.
+unsafe impl FrameAllocator for KernelAllocator {
+    type Error = SvsmError;
+
+    fn allocate_frame(&mut self) -> Result<PhysAddr, SvsmError> {
+        let page: PageBox<PTPage> = PageBox::try_new_zeroed()?;
+        let paddr = virt_to_phys(page.vaddr());
+        let _ = PageBox::leak(page);
+        Ok(make_private_address(paddr))
+    }
+
+    unsafe fn deallocate_frame(&mut self, paddr: PhysAddr) {
+        let vaddr = phys_to_virt(strip_confidentiality_bits(paddr));
+        // SAFETY: paddr was returned by allocate_frame (via PageBox::leak),
+        // so reconstructing the PageBox from the same pointer is valid.
+        unsafe {
+            let ptr = NonNull::new(vaddr.as_mut_ptr::<PTPage>()).unwrap();
+            let _ = PageBox::from_raw(ptr);
+        }
+    }
+}
+
+/// Kernel page table type alias using the generic paging crate PageTable.
+pub type KernelPageTable = paging::PageTable<KernelAllocator>;
 
 /// Represents a sub-tree of a page-table which can be mapped at a top-level index
 #[derive(Debug, FromZeros)]
