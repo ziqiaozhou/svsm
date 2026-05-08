@@ -6,7 +6,7 @@
 # Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
 # A script to format code inside verus macro.
 
-for f in `find ./ -type f -name "*.verus.rs"`
+for f in `find ./ -type f -name "*.verus.rs"` `find ./ -type f -name "*_spec.rs"`  `find ./ -type f -name "*_proof.rs"` 
 do
 output=$(verusfmt $f $@ 2>&1)
 if [ $? -ne 0 ]; then
