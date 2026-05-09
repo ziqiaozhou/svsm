@@ -10,6 +10,10 @@
 #![allow(missing_debug_implementations)]
 use verus_builtin_macros::*;
 
+#[cfg(verus_keep_ghost)]
+mod align_proof;
+#[cfg(verus_keep_ghost)]
+mod align_spec;
 pub mod bits;
 #[cfg(verus_keep_ghost)]
 pub mod frac_perm;
@@ -21,6 +25,11 @@ pub mod nonlinear;
 pub mod set;
 #[cfg(verus_keep_ghost)]
 pub mod sum;
+#[cfg(verus_keep_ghost)]
+pub mod align {
+    pub use crate::align_proof::*;
+    pub use crate::align_spec::*;
+}
 
 verus! {
 
