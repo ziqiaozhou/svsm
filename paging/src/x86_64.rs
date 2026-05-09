@@ -8,7 +8,7 @@
 
 use bitflags::bitflags;
 
-use crate::pagetable::GenericPageTableFlags;
+use crate::pagetable::{GenericPageTableFlags, PageLevel, PagingLevel};
 
 bitflags! {
     /// x86_64 page table entry flags.
@@ -63,4 +63,20 @@ impl PTEntryFlags {
     pub fn task_data_ro() -> Self {
         Self::PRESENT | Self::NX | Self::ACCESSED
     }
+}
+
+/// x86_64 4-level paging (PML4).
+#[derive(Clone, Copy, Debug)]
+pub struct Pml4Level;
+
+impl PagingLevel for Pml4Level {
+    const TOP_LEVEL: PageLevel = PageLevel::Level3;
+}
+
+/// x86-64 PDPT-rooted 3-level page table sub-tree.
+#[derive(Clone, Copy, Debug)]
+pub struct PdptLevel;
+
+impl PagingLevel for PdptLevel {
+    const TOP_LEVEL: PageLevel = PageLevel::Level2;
 }
