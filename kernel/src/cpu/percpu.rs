@@ -747,7 +747,8 @@ impl PerCpu {
         let paddr = virt_to_phys(vaddr);
         let flags = PTEntryFlags::data();
         self.get_pgtable()
-            .map_4k(SVSM_PERCPU_BASE, paddr, flags, false)
+            .map_4k(SVSM_PERCPU_BASE, paddr, flags, false)?;
+        Ok(())
     }
 
     pub fn map_self(&self) -> Result<(), SvsmError> {

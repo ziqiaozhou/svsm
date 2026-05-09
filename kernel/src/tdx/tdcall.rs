@@ -79,6 +79,7 @@ impl From<PageFrame> for EptMappingInfo {
             PageFrame::Size4K(gpa) => (u64::from(gpa), 0),
             PageFrame::Size2M(gpa) => (u64::from(gpa), 1),
             PageFrame::Size1G(gpa) => (u64::from(gpa), 2),
+            _ => unreachable!(),
         };
         Self::new()
             .with_flags(flags)
