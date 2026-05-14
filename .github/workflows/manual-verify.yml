@@ -9,6 +9,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  VERUS_INSTALL_DIR: citests/verus
 
 permissions:
   contents: read
@@ -29,17 +30,26 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Get VERUS from cache
+        id: verus_cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ env.VERUS_INSTALL_DIR }}
+          key: verus-${{ runner.os }}
+
       - name: Install verus toolchains
-        run: ./scripts/vinstall.sh
+        run: |
+          PATH=${{ env.VERUS_INSTALL_DIR }}:$PATH ./scripts/vinstall.sh
+
 
       - name: Format spec/proof code
         run: |
           verusfmt --check `find ./ -name *.verus.rs` --verus-only
 
       - name: Verify svsm with verus
-        run: cargo verify
+        run: PATH=${{ env.VERUS_INSTALL_DIR }}:$PATH cargo verify
         working-directory: kernel
 
       - name: Verify extra proof libs with verus
-        run: cargo verify
+        run: PATH=${{ env.VERUS_INSTALL_DIR }}:$PATH cargo verify
         working-directory: verification/verify_proof
