@@ -4,11 +4,13 @@
 //
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
 //
+#[rustfmt::skip]
 use crate::util::{
     align_down_integer_ens, align_up_integer_ens, proof_align_down, proof_align_up,
 };
-use verify_external::convert::{exists_into, forall_into};
-use verify_external::hw_spec::SpecVAddrImpl;
+use external_specs::convert::{exists_into, forall_into};
+use external_specs::hw_spec::SpecVAddrImpl;
+#[rustfmt::skip]
 use vstd::raw_ptr::{ptr_from_data, ptr_mut_from_data, PtrData};
 use vstd::set_lib::set_int_range;
 use vstd::std_specs::cmp::PartialOrdSpec;
@@ -18,16 +20,16 @@ use vstd::std_specs::ops::AddSpec;
 verus! {
 
 pub broadcast group sign_extend_proof {
-    verify_proof::bits::lemma_bit_usize_not_is_sub,
-    verify_proof::bits::lemma_bit_usize_shl_values,
-    verify_proof::bits::lemma_bit_usize_or_mask,
-    verify_proof::bits::lemma_bit_usize_and_mask,
+    core_proofs::bits::lemma_bit_usize_not_is_sub,
+    core_proofs::bits::lemma_bit_usize_shl_values,
+    core_proofs::bits::lemma_bit_usize_or_mask,
+    core_proofs::bits::lemma_bit_usize_and_mask,
     lemma_check_sign_bit,
 }
 
 pub broadcast group address_align_proof {
     crate::sizes::group_types_proof,
-    verify_proof::bits::lemma_bit_usize_and_mask_is_mod,
+    core_proofs::bits::lemma_bit_usize_and_mask_is_mod,
     proof_align_up,
     proof_align_down,
     address_spec::lemma_align_up_requires,
@@ -38,7 +40,7 @@ broadcast group vaddr_impl_proof {
     sign_extend_proof,
     address_spec::lemma_inner_addr_as_vaddr,
     address_spec::lemma_upper_address_has_sign_bit,
-    verify_proof::bits::lemma_bit_usize_and_mask_is_mod,
+    core_proofs::bits::lemma_bit_usize_and_mask_is_mod,
     address_align_proof,
     address_spec::reveal_pfn,
 }
@@ -138,7 +140,7 @@ impl VirtAddr {
                 self@ - 0xffff_0000_0000_0000
             },
     {
-        broadcast use verify_proof::bits::lemma_bit_usize_not_is_sub;
+        broadcast use core_proofs::bits::lemma_bit_usize_not_is_sub;
 
         assert(VADDR_UPPER_MASK == 0xffff_8000_0000_0000);
     }

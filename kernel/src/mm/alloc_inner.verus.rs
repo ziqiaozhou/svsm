@@ -5,16 +5,16 @@
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
 //
 // Spec and proofs that does not need private types in alloc.rs
-use crate::mm::alloc::VirtAddr;
 use crate::mm::LinearMap;
-use crate::types::{lemma_page_size, PAGE_SIZE};
+use crate::mm::alloc::VirtAddr;
+use crate::types::{PAGE_SIZE, lemma_page_size};
 use crate::utils::util::spec_align_up;
 
 use crate::mm::alloc::MAX_ORDER;
-use verify_external::hw_spec::SpecVAddrImpl;
-use verify_proof::bits::*;
-use verify_proof::frac_ptr::*;
-use verify_proof::nonlinear::*;
+use core_proofs::bits::*;
+use core_proofs::frac_ptr::*;
+use core_proofs::nonlinear::*;
+use external_specs::hw_spec::SpecVAddrImpl;
 use vstd::arithmetic::div_mod::*;
 use vstd::arithmetic::mul::lemma_mul_is_distributive_add_other_way;
 use vstd::math::min;
@@ -199,7 +199,7 @@ impl<const N: usize> PageCountParam<N> {
         let x = self.page_count * 8 as int;
         assert(PAGE_SIZE == 0x1000);
         let count = spec_align_up(x, PAGE_SIZE as int);
-        verify_proof::nonlinear::lemma_align_up_properties(x, PAGE_SIZE as int, count);
+        core_proofs::nonlinear::lemma_align_up_properties(x, PAGE_SIZE as int, count);
         assert(self.page_count * 8 / 0x1000 == self.page_count / 512);
     }
 
@@ -224,7 +224,7 @@ impl<const N: usize> PageCountParam<N> {
                 0 < order < 64,
         ;
         if self.valid_pfn_order(pfn, order) && order > 0 {
-            verify_proof::nonlinear::lemma_modulus_product_divisibility(
+            core_proofs::nonlinear::lemma_modulus_product_divisibility(
                 pfn as int,
                 lower_n as int,
                 2,

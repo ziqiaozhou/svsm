@@ -9,7 +9,7 @@ verus! {
 
 use vstd::std_specs::ops::{SubSpec, AddSpec};
 
-broadcast use verify_proof::bits::lemma_bit_usize_shl_values;
+broadcast use core_proofs::bits::lemma_bit_usize_shl_values;
 
 #[verifier(inline)]
 pub spec const VADDR_MAX_BITS: nat = 48;
@@ -100,7 +100,7 @@ pub broadcast proof fn lemma_inner_addr_as_vaddr(bits: InnerAddr)
         VADDR_UPPER_MASK > VADDR_LOWER_MASK,
 {
     broadcast use sign_extend_proof;
-    broadcast use verify_proof::bits::lemma_bit_usize_shl_values;
+    broadcast use core_proofs::bits::lemma_bit_usize_shl_values;
 
     assert(top_all_ones(bits) == (bits >= VADDR_UPPER_MASK)) by (bit_vector);
     assert(top_all_zeros(bits) == (bits <= VADDR_LOWER_MASK)) by (bit_vector);
@@ -116,9 +116,9 @@ pub broadcast proof fn reveal_pfn(addr: usize)
         #[trigger] pfn_spec(addr) == addr / PAGE_SIZE,
         pfn_spec(addr) == addr >> PAGE_SHIFT,
 {
-    broadcast use verify_proof::bits::lemma_bit_usize_shl_values;
+    broadcast use core_proofs::bits::lemma_bit_usize_shl_values;
 
-    verify_proof::bits::lemma_bit_usize_shr_is_div(addr, PAGE_SHIFT);
+    core_proofs::bits::lemma_bit_usize_shr_is_div(addr, PAGE_SHIFT);
 }
 
 #[verifier(inline)]

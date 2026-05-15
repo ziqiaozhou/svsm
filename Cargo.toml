@@ -25,8 +25,8 @@ members = [
     # PackIt library and command line utility
     "packit",
     # verification libraries for svsm
-    "verification/verify_proof",
-    "verification/verify_external",
+    "verification/core_proofs",
+    "verification/external_specs",
     # User-space support library
     "user/lib",
     # Init user-space module
@@ -109,8 +109,8 @@ verus_state_machines_macros = { version = "=0.0.0-2026-04-05-0114", default-feat
 vstd = { version = "=0.0.0-2026-04-12-0118", features = ["alloc", "allow_panic"], default-features = false }
 
 # Verification libs
-verify_proof = { path = "verification/verify_proof", default-features = false  }
-verify_external = { path = "verification/verify_external", default-features = false  }
+core_proofs = { path = "verification/core_proofs", default-features = false  }
+external_specs = { path = "verification/external_specs", default-features = false  }
 
 [profile.release]
 panic = 'abort'

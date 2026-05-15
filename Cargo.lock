@@ -518,6 +518,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "core_proofs"
+version = "0.1.0"
+dependencies = [
+ "seq-macro",
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
+ "vstd",
+]
+
+[[package]]
 name = "cpuarch"
 version = "0.1.0"
 dependencies = [
@@ -691,6 +702,15 @@ name = "embedded-io"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
+name = "external_specs"
+version = "0.1.0"
+dependencies = [
+ "verus_builtin",
+ "verus_builtin_macros",
+ "vstd",
+]
 
 [[package]]
 name = "ff"
@@ -1474,8 +1494,8 @@ name = "paging"
 version = "0.1.0"
 dependencies = [
  "bitflags",
- "verify_external",
- "verify_proof",
+ "core_proofs",
+ "external_specs",
  "verus_stub",
  "vstd",
  "zerocopy",
@@ -1952,8 +1972,10 @@ dependencies = [
  "cocoon-tpm-tpm2-interface",
  "cocoon-tpm-utils-common",
  "concat-kdf",
+ "core_proofs",
  "cpuarch",
  "elf",
+ "external_specs",
  "gdbstub",
  "gdbstub_arch",
  "igvm_defs",
@@ -1973,8 +1995,6 @@ dependencies = [
  "syscall",
  "test",
  "uuid",
- "verify_external",
- "verify_proof",
  "verus_builtin",
  "verus_builtin_macros",
  "verus_stub",
@@ -2262,26 +2282,6 @@ name = "uuid"
 version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
-
-[[package]]
-name = "verify_external"
-version = "0.1.0"
-dependencies = [
- "verus_builtin",
- "verus_builtin_macros",
- "vstd",
-]
-
-[[package]]
-name = "verify_proof"
-version = "0.1.0"
-dependencies = [
- "seq-macro",
- "verus_builtin",
- "verus_builtin_macros",
- "verus_state_machines_macros",
- "vstd",
-]
 
 [[package]]
 name = "version_check"

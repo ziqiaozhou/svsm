@@ -59,7 +59,7 @@ impl<T> IsAlignedSpec for T where
 
 verus! {
 
-use verify_proof::bits::is_pow_of_2;
+use core_proofs::bits::is_pow_of_2;
 
 #[verifier(inline)]
 pub open spec fn align_requires(align: u64) -> bool {

@@ -137,7 +137,7 @@ impl LinearMap {
                 vaddr.property_canonical();
                 self.virt_start.property_canonical();
                 assert(self.virt_start.offset() % 0x1000 == 0);
-                broadcast use verify_proof::bits::lemma_bit_usize_not_is_sub;
+                broadcast use core_proofs::bits::lemma_bit_usize_not_is_sub;
 
             }
         }

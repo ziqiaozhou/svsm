@@ -20,9 +20,9 @@ use crate::address::group_addr_proofs;
 use crate::mm::address_space::LinearMap;
 use crate::types::lemma_page_size;
 use crate::utils::tcb_ptr::*;
-use verify_external::hw_spec::SpecMemMapTr;
-use verify_proof::bits::*;
-use verify_proof::frac_ptr::FracTypedPerm;
+use core_proofs::bits::*;
+use core_proofs::frac_ptr::FracTypedPerm;
+use external_specs::hw_spec::SpecMemMapTr;
 use vstd::arithmetic::mul::*;
 use vstd::modes::tracked_swap;
 use vstd::raw_ptr::IsExposed;
@@ -35,8 +35,8 @@ mod alloc_spec { include!("alloc_inner.verus.rs");  }
 use alloc_spec::*;
 
 broadcast group set_len_group {
-    verify_proof::set::lemma_len_filter,
-    verify_proof::set::lemma_len_subset,
+    core_proofs::set::lemma_len_filter,
+    core_proofs::set::lemma_len_subset,
 }
 
 broadcast group alloc_broadcast_group {

@@ -7,13 +7,13 @@
 // It provides a safe interface to access a pointer with a tracked memory permission.
 // This is a basic support for read and write access to private memory.
 // TODO:
-// - Move the spec into verify_external after verus supports extra arguments in external functions.
+// - Move the spec into external_specs after verus supports extra arguments in external functions.
 // - Extend FracTypedPointer to support memory operations for confidential VMs.
 
 use verus_stub::*;
 
 #[cfg(verus_keep_ghost)]
-use verify_proof::frac_ptr::FracTypedPerm;
+use core_proofs::frac_ptr::FracTypedPerm;
 
 /// Trusted API to write a value at the pointer.
 /// Do not use this outside verified code.

@@ -11,7 +11,7 @@
 // Proofs:
 // - FixedAddressMappingRange is viewed as LinearMap
 // - LinearMap satisfies all properties in hw_spec::SpecMemMapTr
-use verify_external::hw_spec::SpecMemMapTr;
+use external_specs::hw_spec::SpecMemMapTr;
 use vstd::std_specs::convert::FromSpec;
 
 use crate::address::VADDR_RANGE_SIZE;
@@ -50,7 +50,7 @@ impl FixedAddressMappingRange {
             self@.wf(),
             self.wf(),
     {
-        broadcast use verify_proof::bits::lemma_bit_usize_shl_values;
+        broadcast use core_proofs::bits::lemma_bit_usize_shl_values;
 
         use_type_invariant(self);
         use_type_invariant(self.virt_start);

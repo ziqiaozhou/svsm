@@ -10,9 +10,9 @@
 // and guarantee that the page info is immutable once shared.
 // PageInfoDb is the main data structure to track the page info with the same
 // shared status.
-use verify_proof::frac_ptr::tracked_map_merge_right_shares;
-use verify_proof::frac_ptr::tracked_map_shares;
-use verify_proof::set::{lemma_set_usize_range, set_usize_range};
+use core_proofs::frac_ptr::tracked_map_merge_right_shares;
+use core_proofs::frac_ptr::tracked_map_shares;
+use core_proofs::set::{lemma_set_usize_range, set_usize_range};
 use vstd::raw_ptr::PtrData;
 
 verus! {
