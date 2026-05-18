@@ -14,7 +14,7 @@ vstd = { workspace = true, optional = true }
 
 [features]
 default = []
-verus = ["core_proofs/verus", "external_specs/verus", "vstd", "verus_stub/disable"]
+verus = ["core_proofs", "external_specs", "vstd", "verus_stub/disable"]
 
 [package.metadata.verus]
 verify = true

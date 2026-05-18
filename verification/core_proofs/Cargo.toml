@@ -6,9 +6,9 @@ edition.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-verus_builtin = { workspace = true, optional = true }
+verus_builtin = { workspace = true }
 verus_builtin_macros = { workspace = true }
-vstd = { workspace = true, optional = true }
+vstd = { workspace = true }
 verus_state_machines_macros = { workspace = true }
 seq-macro = "0.3"
 
@@ -18,7 +18,6 @@ workspace = true
 [features]
 default = []
 noverify = []
-verus = ["verus_builtin", "vstd"]
 
 [package.metadata.verus]
 verify = true

@@ -4,9 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-verus_builtin = { workspace = true, optional = true }
+verus_builtin = { workspace = true }
 verus_builtin_macros = { workspace = true }
-vstd = { workspace = true, optional = true }
+vstd = { workspace = true }
 
 [lints]
 workspace = true
@@ -14,7 +14,6 @@ workspace = true
 [features]
 default = []
 noverify = []
-verus = ["verus_builtin", "vstd"]
 
 [package.metadata.verus]
 verify = true
