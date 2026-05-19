@@ -3,6 +3,7 @@
 // Copyright (c) Microsoft Corporation
 //
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
+#![cfg(verus_only)]
 use vstd::multiset::Multiset;
 use vstd::prelude::*;
 

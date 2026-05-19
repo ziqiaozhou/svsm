@@ -8,6 +8,7 @@
 // Copyright (c) Microsoft Corporation
 //
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
+#![cfg(verus_only)]
 use vstd::prelude::*;
 verus! {
 

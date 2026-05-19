@@ -11,7 +11,7 @@ use crate::fs::Buffer;
 use crate::locking::SpinLock;
 use crate::mm::virt_to_phys;
 use crate::types::{PAGE_SHIFT, PAGE_SIZE};
-#[cfg_attr(verus_keep_ghost, allow(unused_imports))]
+#[cfg_attr(verus_only, allow(unused_imports))]
 use crate::utils::tcb_ptr::{ptr_read, ptr_write};
 use crate::utils::{align_down, align_up, zero_mem_region};
 use core::alloc::{GlobalAlloc, Layout};
@@ -24,7 +24,7 @@ use crate::locking::LockGuard;
 
 use verus_stub::*;
 
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 include!("alloc.verus.rs");
 
 /// Represents possible errors that can occur during memory allocation.
@@ -531,7 +531,7 @@ struct HeapMemoryRegion {
     nr_pages: [usize; MAX_ORDER],
     next_page: [usize; MAX_ORDER],
     free_pages: [usize; MAX_ORDER],
-    #[cfg(verus_keep_ghost_body)]
+    #[cfg(verus_only)]
     perms: Tracked<MemoryRegionPerms>, // tracks all memory region permissions
 }
 
@@ -553,7 +553,7 @@ impl HeapMemoryRegion {
             nr_pages: [0; MAX_ORDER],
             next_page: [NO_PAGE; MAX_ORDER],
             free_pages: [0; MAX_ORDER],
-            #[cfg(verus_keep_ghost_body)]
+            #[cfg(verus_only)]
             perms: Tracked::assume_new(),
         }
     }
@@ -728,7 +728,7 @@ impl HeapMemoryRegion {
             reveal(<LinearMap as SpecMemMapTr>::to_paddr);
         };
         (self.start_virt <= vaddr && (vaddr - self.start_virt) < self.page_count * PAGE_SIZE).then(
-            #[cfg_attr(verus_keep_ghost_body, verus_spec(ret: usize =>
+            #[cfg_attr(verus_only, verus_spec(ret: usize =>
                 requires
                     vaddr.offset() > self.start_virt.offset()
                 ensures
@@ -752,7 +752,7 @@ impl HeapMemoryRegion {
         }
         self.get_virt_offset(vaddr)
             .map(
-                #[cfg_attr(verus_keep_ghost_body, verus_spec(ret: usize =>
+                #[cfg_attr(verus_only, verus_spec(ret: usize =>
                     ensures ret == off / PAGE_SIZE
                 ))]
                 |off: usize| off / PAGE_SIZE,
@@ -815,13 +815,13 @@ impl HeapMemoryRegion {
     fn mark_compound_page(&mut self, pfn: usize, order: usize) {
         let nr_pages: usize = 1 << order;
         let compound = PageInfo::Compound(CompoundInfo { order });
-        #[cfg_attr(verus_keep_ghost_body, verus_spec(
+        #[cfg_attr(verus_only, verus_spec(
             invariant
                 old(self).ens_mark_compound_page_loop(*self, pfn, i, order, *old(perms), *perms),
             decreases
                 nr_pages - i,
         ))]
-        #[cfg_attr(verus_keep_ghost_body, verifier::loop_isolation(false))]
+        #[cfg_attr(verus_only, verifier::loop_isolation(false))]
         for i in 1..nr_pages {
             proof_decl! {
                 let ghost current = (pfn + i) as usize;
@@ -1116,7 +1116,7 @@ impl HeapMemoryRegion {
             return Err(AllocError::InvalidPageOrder(order));
         }
 
-        #[cfg(not(verus_keep_ghost))]
+        #[cfg(not(verus_only))]
         assert_eq!(pfn & ((1usize << order) - 1), 0);
         let pfn = pfn ^ (1usize << order);
         if pfn >= self.page_count {
@@ -1237,7 +1237,7 @@ impl HeapMemoryRegion {
             idx_ = idx_ - 1;
         }
 
-        #[cfg_attr(verus_keep_ghost, verus_spec(
+        #[cfg_attr(verus_only, verus_spec(
             invariant
                 *self === *old(self),
                 self.wf_next_pages(),

@@ -3,8 +3,7 @@
 // Copyright (c) Microsoft Corporation
 //
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
-#![cfg(verus_keep_ghost)]
-
+#![cfg(verus_only)]
 use vstd::arithmetic::power2::pow2;
 use vstd::bits::low_bits_mask;
 use vstd::prelude::*;

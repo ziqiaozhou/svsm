@@ -14,7 +14,7 @@
 #![no_std]
 #![allow(unused_braces)]
 #![allow(unexpected_cfgs)]
-#![cfg_attr(verus_keep_ghost, feature(sized_hierarchy))]
+#![cfg_attr(verus_only, feature(sized_hierarchy))]
 
 // Add spec for convert traits
 pub mod convert;
@@ -25,10 +25,10 @@ pub mod nonnull;
 
 pub mod ptr;
 
-use verus_builtin_macros::*;
+use vstd::prelude::*;
 
 verus! {
-#[cfg_attr(verus_keep_ghost, verifier::broadcast_use_by_default_when_this_crate_is_imported)]
+#[cfg_attr(verus_only, verifier::broadcast_use_by_default_when_this_crate_is_imported)]
 pub broadcast group external_axiom {
 }
 }

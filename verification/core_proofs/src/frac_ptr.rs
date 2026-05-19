@@ -6,6 +6,7 @@
 //
 // A fully verified ghost and non-forgeable frac-based pointer permission to
 // share tracked memory permissions.
+#![cfg(verus_only)]
 use verus_state_machines_macros::*;
 
 use vstd::prelude::*;

@@ -7,6 +7,7 @@
 // A fully verified frac-based ownership to share tracked ghost permissions.
 // This is motivated by PCM lib from vstd.
 // The state-machine proofs are motivated from the proof for Rc in vstd.
+#![cfg(verus_only)]
 use crate::sum::{CountTrait, lemma_sum_insert, lemma_sum_remove, sum};
 use verus_state_machines_macros::*;
 use vstd::modes::tracked_swap;

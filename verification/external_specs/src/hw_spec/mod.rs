@@ -3,8 +3,7 @@
 // Copyright (c) Microsoft Corporation
 //
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
-#![cfg(verus_keep_ghost)]
-
+#![cfg(verus_only)]
 //
 // Defines trusted specifications related to address translation.
 // Address and AddressMap implementations should implement those traits to demonstrate their correctness.

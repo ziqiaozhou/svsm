@@ -12,7 +12,7 @@
 
 use verus_stub::*;
 
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 use core_proofs::frac_ptr::FracTypedPerm;
 
 /// Trusted API to write a value at the pointer.
