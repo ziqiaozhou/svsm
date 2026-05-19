@@ -37,6 +37,17 @@ impl GenericPageTableFlags for PTEntryFlags {
     const HUGE: Self = Self::HUGE;
     const GLOBAL: Self = Self::GLOBAL;
     const NX: Self = Self::NX;
+
+    /// present, writable, user-accessible, and accessed.
+    /// ACCESSED => prevent future hardware mutations.
+    fn parent_flags() -> Self {
+        Self::PRESENT | Self::WRITABLE | Self::USER | Self::ACCESSED | Self::DIRTY
+    }
+
+    /// present, writable, and accessed, but not user-accessible.
+    fn kern_parent_flags() -> Self {
+        Self::PRESENT | Self::WRITABLE | Self::ACCESSED | Self::DIRTY
+    }
 }
 
 impl PTEntryFlags {
