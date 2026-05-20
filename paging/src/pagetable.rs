@@ -266,6 +266,9 @@ pub trait GenericPageTableFlags:
     + Copy
     + Clone
 {
+    const PRESENT: Self;
+    const USER: Self;
+    const HUGE: Self;
 
     /// Default flags of new parent page table entries for kernel mappings.
     /// Includes `PRESENT` but not `USER`, so the mapping is supervisor-only.
@@ -275,14 +278,17 @@ pub trait GenericPageTableFlags:
     /// Use this if the mapping could be user-accessible;
     fn parent_flags() -> Self;
 
-    const PRESENT: Self;
-    const WRITABLE: Self;
-    const USER: Self;
-    const ACCESSED: Self;
-    const DIRTY: Self;
-    const HUGE: Self;
-    const GLOBAL: Self;
-    const NX: Self;
+    fn huge(&self) -> bool {
+        self.contains(Self::HUGE)
+    }
+
+    fn present(&self) -> bool {
+        self.contains(Self::PRESENT)
+    }
+
+    fn user(&self) -> bool {
+        self.contains(Self::USER)
+    }
 }
 
 const _: () = assert!(
@@ -311,32 +317,17 @@ impl<A: ArchPagingMeta> PTEntry<A> {
 
     /// Check if the page table entry is present.
     pub fn present(&self) -> bool {
-        self.flags().contains(A::PTFlags::PRESENT)
+        self.flags().present()
     }
 
     /// Check if the page table entry is huge.
     pub fn huge(&self) -> bool {
-        self.flags().contains(A::PTFlags::HUGE)
-    }
-
-    /// Check if the page table entry is writable.
-    pub fn writable(&self) -> bool {
-        self.flags().contains(A::PTFlags::WRITABLE)
-    }
-
-    /// Check if the page table entry is NX (no-execute).
-    pub fn nx(&self) -> bool {
-        self.flags().contains(A::PTFlags::NX)
+        self.flags().huge()
     }
 
     /// Check if the page table entry is user-accessible.
     pub fn user(&self) -> bool {
-        self.flags().contains(A::PTFlags::USER)
-    }
-
-    /// Check if the page table entry is global.
-    pub fn global(&self) -> bool {
-        self.flags().contains(A::PTFlags::GLOBAL)
+        self.flags().user()
     }
 
     /// Get the raw bits (`usize`) of the page table entry.
@@ -557,13 +548,8 @@ impl<A: ArchPagingMeta, P: PagingHandler + SelfMap> GenericPageTable<A, P, Pagin
     ///
     /// `paddr` is the physical address of *this* page table's root page.
     /// The self-map PML4 entry is written at [`SelfMap::SELFMAP_IDX`].
-    pub fn init_self_map(&mut self, paddr: PhysAddr) {
+    pub fn init_self_map(&mut self, paddr: PhysAddr, flags: A::PTFlags) {
         let entry = &mut self.root_mut()[P::SELFMAP_IDX];
-        let flags = A::PTFlags::PRESENT
-            | A::PTFlags::WRITABLE
-            | A::PTFlags::ACCESSED
-            | A::PTFlags::DIRTY
-            | A::PTFlags::NX;
         entry.set(A::make_private_address(paddr), flags);
     }
 
@@ -838,7 +824,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     ///
     /// # Parameters
     /// - `vaddr`: The virtual address for which to allocate the PTE.
-    /// - `parent_flags`: The flags to apply to the allocated page table entries.
+    /// - `parent_flags`: The flags to apply to parent entries if allocating ones.
     ///
     /// # Returns
     /// A `Mapping` representing the allocated or existing PTE for the address.
@@ -856,7 +842,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     ///
     /// # Parameters
     /// - `vaddr`: The virtual address for which to allocate the PTE.
-    /// - `parent_flags`: The flags to apply to the allocated page table entries.
+    /// - `parent_flags`: The flags to apply to parent entries if allocating ones.
     ///
     /// # Returns
     /// A `Mapping` representing the allocated or existing PTE for the address.
@@ -880,7 +866,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         let (page, paddr) = PTPage::<A, P>::alloc()?;
         let mut flags = entry.flags();
 
-        assert!(flags.contains(A::PTFlags::HUGE));
+        assert!(flags.huge());
 
         let addr_2m = PhysAddr::from(entry.address().bits() & 0x000f_ffff_fff0_0000);
 
@@ -1077,8 +1063,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// - `paddr`: The physical address to map to.
     /// - `flags`: The flags to apply to the mapping.
     /// - `shared`: Indicates whether the mapping is shared.
-    /// - `parent_flags`: The flags to apply to parent page table entries if new page tables
-    ///    need to be allocated.
+    /// - `parent_flags`: The flags to apply to parent entries if allocating ones.
     ///
     /// # Returns
     /// A result indicating success or failure ([`PagingError`]).
@@ -1164,7 +1149,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
             PageLevel::Level0 => {
                 let offset = vaddr.page_offset();
                 let entry = mapping.entry;
-                if !entry.flags().contains(A::PTFlags::PRESENT) {
+                if !entry.present() {
                     return Err(PagingError::NotMapped);
                 }
                 Ok(entry.address() + offset)
@@ -1172,8 +1157,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
             PageLevel::Level1 => {
                 let offset = vaddr.bits() & (PAGE_SIZE_2M - 1);
                 let entry = mapping.entry;
-                if !entry.flags().contains(A::PTFlags::PRESENT)
-                    || !entry.flags().contains(A::PTFlags::HUGE)
+                if !entry.present() || !entry.huge()
                 {
                     return Err(PagingError::NotMapped);
                 }

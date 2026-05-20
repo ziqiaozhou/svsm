@@ -20,6 +20,8 @@ bitflags! {
         const PRESENT       = 1 << 0;
         const WRITABLE      = 1 << 1;
         const USER          = 1 << 2;
+        const WRITE_THROUGH = 1 << 3;
+        const NO_CACHE      = 1 << 4;
         const ACCESSED      = 1 << 5;
         const DIRTY         = 1 << 6;
         const HUGE          = 1 << 7;
@@ -30,13 +32,8 @@ bitflags! {
 
 impl GenericPageTableFlags for PTEntryFlags {
     const PRESENT: Self = Self::PRESENT;
-    const WRITABLE: Self = Self::WRITABLE;
     const USER: Self = Self::USER;
-    const ACCESSED: Self = Self::ACCESSED;
-    const DIRTY: Self = Self::DIRTY;
     const HUGE: Self = Self::HUGE;
-    const GLOBAL: Self = Self::GLOBAL;
-    const NX: Self = Self::NX;
 
     /// present, writable, user-accessible, and accessed.
     /// ACCESSED => prevent future hardware mutations.
@@ -48,9 +45,34 @@ impl GenericPageTableFlags for PTEntryFlags {
     fn kern_parent_flags() -> Self {
         Self::PRESENT | Self::WRITABLE | Self::ACCESSED | Self::DIRTY
     }
+
+    /// Check if the page table entry is huge.
+    fn huge(&self) -> bool {
+        self.contains(Self::HUGE)
+    }
 }
 
 impl PTEntryFlags {
+    /// Check if the page table entry is writable.
+    pub fn writable(&self) -> bool {
+        self.contains(Self::WRITABLE)
+    }
+
+    /// Check if the page table entry is user-accessible.
+    pub fn user(&self) -> bool {
+        self.contains(Self::USER)
+    }
+
+    /// Check if the page table entry is NX (no-execute).
+    pub fn nx(&self) -> bool {
+        self.contains(Self::NX)
+    }
+
+    /// Check if the page table entry is global.
+    pub fn global(&self) -> bool {
+        self.contains(Self::GLOBAL)
+    }
+
     pub fn exec() -> Self {
         Self::PRESENT | Self::GLOBAL | Self::ACCESSED
     }

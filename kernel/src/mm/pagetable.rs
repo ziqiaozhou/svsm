@@ -399,7 +399,12 @@ impl PageTable {
     fn allocate_new() -> Result<PageBox<Self>, SvsmError> {
         let mut pgtable: PageBox<Self> = PageBox::try_new_zeroed()?;
         let paddr = virt_to_phys(pgtable.vaddr());
-        pgtable.init_self_map(paddr);
+        let flags: PTEntryFlags = PTEntryFlags::PRESENT
+            | PTEntryFlags::WRITABLE
+            | PTEntryFlags::ACCESSED
+            | PTEntryFlags::DIRTY
+            | PTEntryFlags::NX;
+        pgtable.init_self_map(paddr, flags);
         Ok(pgtable)
     }
 
@@ -625,7 +630,7 @@ impl PageTable {
                     level: PageLevel::Level0,
                     entry,
                 } => {
-                    if !entry.present() || !entry.global() {
+                    if !entry.present() || !entry.flags().global() {
                         return Err(SvsmError::Mem);
                     }
 
@@ -929,7 +934,7 @@ impl PTWalkAttr {
         // address with a translation for which the R/W flag is 0 in any
         // paging-structure entry controlling the translation.
         // The same for user mode address
-        if !entry.writable() {
+        if !entry.flags().writable() {
             *pteflags &= !PTEntryFlags::WRITABLE;
         }
 
@@ -940,9 +945,9 @@ impl PTWalkAttr {
         // controlling the translation; instructions may not be fetched from
         // any supervisor-mode address with a translation for which the XD flag
         // is 1 in any paging-structure entry controlling the translation
-        if self.efer.contains(EFERFlags::NXE) && entry.nx() {
+        if self.efer.contains(EFERFlags::NXE) && entry.flags().nx() {
             *pteflags |= PTEntryFlags::NX;
-        } else if !self.efer.contains(EFERFlags::NXE) && entry.nx() {
+        } else if !self.efer.contains(EFERFlags::NXE) && entry.flags().nx() {
             // XD bit must be 0 if efer.NXE = 0
             return Err(pf_err | PageFaultError::R);
         }
