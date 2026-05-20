@@ -5,6 +5,7 @@
 #![no_std]
 
 pub mod address;
+pub mod pagetable;
 pub mod sizes;
 pub mod traits;
 pub mod util;
