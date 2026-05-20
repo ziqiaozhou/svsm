@@ -516,7 +516,8 @@ impl PageTable {
         shared: bool,
     ) -> Result<(), SvsmError> {
         let (start, end) = (vregion.start(), vregion.end());
-        self.0.map_region_4k(start, end, phys, flags, shared)?;
+        self.0
+            .map_region_4k(start, end, phys, flags, shared)?;
         Ok(())
     }
 
@@ -528,7 +529,11 @@ impl PageTable {
         let (start, end) = (vregion.start(), vregion.end());
         let flush = self.0.unmap_region_4k(start, end);
         if let TlbFlushRange::Range { region, pgsize } = flush.scope().unwrap().range {
-            assert!(region.start() == start && region.end() == end && pgsize == PageSize::Regular);
+            assert!(
+                region.start() == start
+                    && region.end() == end
+                    && pgsize == PageSize::Regular
+            );
         }
         flush
     }
