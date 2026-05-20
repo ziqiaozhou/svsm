@@ -9,12 +9,16 @@
 #![no_std]
 
 pub mod address;
+pub mod pagetable;
 pub mod sizes;
 pub mod traits;
 pub mod util;
 pub mod x86_64;
 
 pub use address::{Address, PhysAddr, VirtAddr};
+pub use pagetable::{
+    ENTRY_COUNT, GenericPageTable, Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame,
+};
 pub use sizes::{
     PAGE_SHIFT, PAGE_SHIFT_1G, PAGE_SHIFT_2M, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize,
 };
