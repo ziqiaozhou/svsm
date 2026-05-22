@@ -811,7 +811,9 @@ impl PageInfoDb {
             final(unit).id() == old(unit).id().update_shares(
                 old(unit).id().shares + old(self).id().shares,
             ),
-            final(unit).unit_head()@ == old(unit).unit_head()@.update_shares(final(unit).id().shares),
+            final(unit).unit_head()@ == old(unit).unit_head()@.update_shares(
+                final(unit).id().shares,
+            ),
             forall|order: usize| #[trigger] old(unit).nr_page(order) == final(unit).nr_page(order),
             final(self)@ == old(self)@.remove_keys(final(unit)@.dom()),
             final(self).id() == old(self).id(),
@@ -882,14 +884,18 @@ impl PageInfoDb {
             old(self).id() == old(unit).id().update_shares(old(self).id().shares),
         ensures
             final(unit).is_unit(),
-            final(unit).unit_head()@ == old(unit).unit_head()@.update_shares(final(unit).id().shares),
+            final(unit).unit_head()@ == old(unit).unit_head()@.update_shares(
+                final(unit).id().shares,
+            ),
             final(unit).id() == old(unit).id().update_shares(
                 (old(unit).id().shares - old(self).id().shares) as nat,
             ),
             final(unit).unit_start() == old(unit).unit_start(),
             final(self).id() == old(self).id(),
             final(self)@.dom() == old(self)@.dom() + old(unit)@.dom(),
-            final(self)@ =~= old(self)@.union_prefer_right(final(self)@.restrict(final(unit)@.dom())),
+            final(self)@ =~= old(self)@.union_prefer_right(
+                final(self)@.restrict(final(unit)@.dom()),
+            ),
             forall|order: usize| #[trigger] old(unit).nr_page(order) == final(unit).nr_page(order),
             final(self).ens_add_unit_nr_pages(*old(self), final(unit).order()),
     {
@@ -913,11 +919,15 @@ impl PageInfoDb {
             0 < shares < old(self).id().shares,
         ensures
             final(self).is_unit(),
-            final(self).unit_head()@ == old(self).unit_head()@.update_shares(final(self).id().shares),
+            final(self).unit_head()@ == old(self).unit_head()@.update_shares(
+                final(self).id().shares,
+            ),
             unit.unit_head()@ == old(self).unit_head()@.update_shares(shares),
             final(self).unit_start() == old(self).unit_start() == unit.unit_start(),
             old(self).npages() == final(self).npages() == unit.npages(),
-            final(self).id() == old(self).id().update_shares((old(self).id().shares - shares) as nat),
+            final(self).id() == old(self).id().update_shares(
+                (old(self).id().shares - shares) as nat,
+            ),
             unit.is_unit(),
             unit.id() == old(self).id().update_shares(shares),
             forall|order: usize| #[trigger]

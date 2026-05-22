@@ -233,7 +233,12 @@ impl MRFreePerms {
             0 <= j < old(self).avail[o2 as int].len() as int,
         ensures
             *final(self) == *old(self),
-            order_disjoint(final(self).avail[o1 as int][i].pfn(), o1, final(self).avail[o2 as int][j].pfn(), o2),
+            order_disjoint(
+                final(self).avail[o1 as int][i].pfn(),
+                o1,
+                final(self).avail[o2 as int][j].pfn(),
+                o2,
+            ),
     {
         reveal(MRFreePerms::wf_at);
         use_type_invariant(&*self);
@@ -273,8 +278,8 @@ impl MRFreePerms {
             *final(self) == *old(self),
             final(self).next_lists()[o as int].no_duplicates(),
             final(self).avail[o as int].len() <= final(self).pg_params().page_count,
-            final(self).avail[o as int].len() * (1usize << o) <= final(self).pg_params().page_count + (1usize
-                << o) - 1,
+            final(self).avail[o as int].len() * (1usize << o) <= final(self).pg_params().page_count
+                + (1usize << o) - 1,
     {
         reveal(MRFreePerms::wf_at);
         use_type_invariant(&*self);
@@ -438,7 +443,10 @@ impl MRFreePerms {
             old(self).wf_strict(),
         ensures
             final(self).wf_strict(),
-            final(self).avail == old(self).avail.update(order as int, final(self).avail[order as int]),
+            final(self).avail == old(self).avail.update(
+                order as int,
+                final(self).avail[order as int],
+            ),
             final(self).avail[order as int] == old(self).avail[order as int].take(
                 old(self).avail[order as int].len() - 1,
             ),
@@ -496,7 +504,10 @@ impl MRFreePerms {
             0 <= order < MAX_ORDER,
             0 <= idx < old(self).avail[order as int].len(),
         ensures
-            final(self).avail == old(self).avail.update(order as int, final(self).avail[order as int]),
+            final(self).avail == old(self).avail.update(
+                order as int,
+                final(self).avail[order as int],
+            ),
             final(self).avail[order as int] == old(self).avail[order as int].remove(idx),
             old(self).ens_perm_valid(order, idx, perm),
             final(self).mr_map() == old(self).mr_map(),
@@ -506,7 +517,8 @@ impl MRFreePerms {
             ),
             old(self).nr_free()[order as int] > 0,
             old(self).wf_strict() ==> old(self).ens_perm_strict(order, idx, perm),
-            old(self).wf_strict() ==> (idx == final(self).avail[order as int].len() ==> final(self).wf_strict()),
+            old(self).wf_strict() ==> (idx == final(self).avail[order as int].len()
+                ==> final(self).wf_strict()),
     {
         reveal(MRFreePerms::wf_at);
         use_type_invariant(&*self);
