@@ -2278,15 +2278,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "verus_builtin"
-version = "0.0.0-2026-05-06-1803"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "650bcc71ef90cbc79bc2a2494c54dd159edad63a72677be791954edc993883fe"
+version = "0.0.0-2026-05-17-0151"
 
 [[package]]
 name = "verus_builtin_macros"
-version = "0.0.0-2026-05-06-1803"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb76a6de59afd73bb34e6cfdf1dc17592b88ce460d7b3cb49eb24f0f86a173d2"
+version = "0.0.0-2026-05-10-0145"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2305,9 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "verus_prettyplease"
-version = "0.0.0-2026-05-06-1803"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdc83b14e7901e5b560a4d6a7107f6990996f8d67f47e3d31d61862df2c2b3d5"
+version = "0.0.0-2026-05-10-0145"
 dependencies = [
  "proc-macro2",
  "verus_syn",
@@ -2315,9 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "verus_state_machines_macros"
-version = "0.0.0-2026-05-06-1803"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e8d918b213a69574fa69b389a72586cb2429addb938ff198e027499ae0a70d2"
+version = "0.0.0-2026-05-10-0145"
 dependencies = [
  "indexmap",
  "proc-macro2",
@@ -2336,9 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "verus_syn"
-version = "0.0.0-2026-05-06-1803"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c69a13786a726af332f1fff4d79dd7400a714033ed3750266d2c2d9b44595201"
+version = "0.0.0-2026-05-10-0145"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2367,9 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "vstd"
-version = "0.0.0-2026-05-06-1803"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8565e53371c0e0ddf2ba80862c532e013d40a310f13beb858e3060cf62a382d0"
+version = "0.0.0-2026-05-17-0151"
 dependencies = [
  "verus_builtin",
  "verus_builtin_macros",

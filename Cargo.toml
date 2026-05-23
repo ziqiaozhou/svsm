@@ -101,10 +101,10 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 embedded-io = { version = "0.6.1" }
 
 # Verus repos
-verus_builtin = { version = "=0.0.0-2026-05-06-1803", default-features = false }
-verus_builtin_macros = { version = "=0.0.0-2026-05-06-1803", features = ["vpanic"], default-features = false }
-verus_state_machines_macros = { version = "=0.0.0-2026-05-06-1803", default-features = false }
-vstd = { version = "=0.0.0-2026-05-06-1803", features = ["alloc", "allow_panic"], default-features = false }
+verus_builtin = { path = "/home/ziqiaozhou/verus/source/builtin", default-features = false }
+verus_builtin_macros = { path = "/home/ziqiaozhou/verus/source/builtin_macros", features = ["vpanic"], default-features = false }
+verus_state_machines_macros = { path = "/home/ziqiaozhou/verus/source/state_machines_macros", default-features = false }
+vstd = { path = "/home/ziqiaozhou/verus/source/vstd", features = ["alloc", "allow_panic"], default-features = false }
 
 # Verification libs
 verify_proof = { path = "verification/verify_proof", default-features = false  }
