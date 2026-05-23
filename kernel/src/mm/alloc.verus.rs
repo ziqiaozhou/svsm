@@ -27,6 +27,7 @@ use vstd::arithmetic::mul::*;
 use vstd::modes::tracked_swap;
 use vstd::raw_ptr::IsExposed;
 use vstd::std_specs::convert::FromSpec;
+use vstd::std_specs::iter::IteratorSpec;
 
 verus! {
 
@@ -338,6 +339,7 @@ impl HeapMemoryRegion {
         &&& new.wf_next_pages()
         &&& !spec_pfn_is_oob(new.next_page[order - 1])
         &&& self.with_same_mapping(new)
+        &&& new.next_page@ =~= self.next_page@.update(order - 1, new.next_page[order - 1])
     }
 
     spec fn spec_get_pfn(&self, vaddr: VirtAddr) -> Option<usize> {
@@ -422,6 +424,20 @@ impl HeapMemoryRegion {
         &&& ret ==> !spec_pfn_is_oob(new.next_page[order as int])
         &&& self.with_same_mapping(&new)
         &&& new.wf_next_pages()
+    }
+
+    spec fn refill_loop_inv(
+        &self,
+        new: &Self,
+        order: usize,
+        refill_order: usize,
+        iter: int,
+    ) -> bool {
+        &&& forall|i|
+            order + 1 <= i < refill_order - iter ==> spec_pfn_is_oob(#[trigger] new.next_page[i])
+        &&& new.wf_next_pages()
+        &&& !spec_pfn_is_oob(new.next_page[refill_order - iter])
+        &&& self.with_same_mapping(new)
     }
 
     spec fn ens_compound_neighbor(
