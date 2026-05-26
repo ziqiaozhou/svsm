@@ -29,7 +29,7 @@ impl<VirtAddr, Entry> View for TLBEntry<VirtAddr, Entry> {
 /// leaf PTE.
 #[verifier::reject_recursive_types(VirtAddr)]
 #[verifier::reject_recursive_types(Entry)]
-struct TLBState<VirtAddr, Entry> {
+pub(super) struct TLBState<VirtAddr, Entry> {
     entries: Map<CpuIdentifier, Map<VirtAddr, TLBEntry<VirtAddr, Entry>>>,
 }
 }

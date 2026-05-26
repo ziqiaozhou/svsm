@@ -7,13 +7,13 @@ enum PTState {
     NotInstalled, // The page table is not installed in any CPU
 }
 
-ghost struct EntryPropertiesSpec {
+pub(super) ghost struct EntryPropertiesSpec {
     valid: bool,
     writable: bool,
     user: bool,
 }
 
-trait EntrySpec {
+pub(super) trait EntrySpec {
     type PhyAddr;
     spec fn address(&self) -> Self::PhyAddr;
     spec fn properties(&self) -> EntryPropertiesSpec;

@@ -8,12 +8,14 @@
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use bitflags::Flags;
+use verus_stub::*;
 use zerocopy::FromBytes;
 
 /// Page table levels (0-based).
 ///
 /// Level0 is the leaf (PTE), Level3 is the root of 4-level paging (PML4E).
 /// At most 4 levels are supported.
+#[verus_verify]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum PageLevel {
@@ -42,6 +44,7 @@ impl PageLevel {
 ///
 /// Architecture-specific ZSTs that implement this trait live in their
 /// respective modules (e.g. `x86_64::Pml4Level`).
+#[verus_verify]
 pub trait PagingLevel {
     /// Highest page table level.
     const TOP_LEVEL: PageLevel;
