@@ -10,3 +10,6 @@ pub mod sizes;
 pub mod traits;
 pub mod util;
 pub mod x86_64;
+
+#[cfg(verus_only)]
+pub mod specs;
