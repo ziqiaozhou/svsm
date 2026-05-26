@@ -1,4 +1,5 @@
 use vstd::prelude::*;
+use crate::traits::PageLevel;
 
 verus!{
 /// Represents the state of a page table.
@@ -8,9 +9,10 @@ enum PTState {
 }
 
 pub(super) ghost struct EntryPropertiesSpec {
-    valid: bool,
-    writable: bool,
-    user: bool,
+    pub valid: bool,
+    pub writable: bool,
+    pub user: bool,
+    pub huge: bool,
 }
 
 pub(super) trait EntrySpec {
@@ -39,10 +41,13 @@ impl<Entry> View for PTEntry<Entry> {
     uninterp spec fn view(&self) -> PTPermView<Entry>;
 }
 
-/// A flatten view of a page table tree.
-#[verifier::reject_recursive_types(VirtAddr)]
-#[verifier::reject_recursive_types(Entry)]
-struct PageTableState<VirtAddr, Entry> {
-    entries: Map<VirtAddr, Seq<PTPermView<Entry>>>, // Each virtual address can have multiple page table entries 
+pub(super) trait PTableSpec {
+    type Entry: EntrySpec;
+
+    spec fn index(&self, i: int) -> Self::Entry;
+}
+
+pub(super) trait PTVAddrSpec {
+    spec fn entry_index(&self, level: PageLevel) -> int;
 }
 }
