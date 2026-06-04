@@ -12,7 +12,7 @@
 // shared status.
 use verify_proof::frac_ptr::tracked_map_merge_right_shares;
 use verify_proof::frac_ptr::tracked_map_shares;
-use verify_proof::set::{lemma_set_usize_range, set_usize_range};
+use verify_proof::set::set_usize_range;
 use vstd::raw_ptr::PtrData;
 
 verus! {
@@ -109,12 +109,12 @@ impl ValidPageInfo for PInfoPerm {
 tracked struct PageInfoDb {
     ghost unit_start: usize,  // only for unit
     ghost id: PInfoGroupId,
-    reserved: Map<usize, PInfoPerm>,
+    reserved: IMap<usize, PInfoPerm>,
 }
 
 impl PageInfoDb {
     /*** Basic spec functions ***/
-    closed spec fn view(&self) -> Map<usize, PInfoPerm> {
+    closed spec fn view(&self) -> IMap<usize, PInfoPerm> {
         self.reserved
     }
 
@@ -133,7 +133,7 @@ impl PageInfoDb {
     }
 
     #[verifier(inline)]
-    spec fn dom(&self) -> Set<usize> {
+    spec fn dom(&self) -> ISet<usize> {
         self@.dom()
     }
 
@@ -175,14 +175,14 @@ impl PageInfoDb {
     /// page number: [unit_start, unit_start+(1usize<<order))
     /// the order is stored in first page info and is consistent across all
     /// page info.
-    spec fn _is_unit(reserved: Map<usize, PInfoPerm>, unit_start: usize) -> bool {
+    spec fn _is_unit(reserved: IMap<usize, PInfoPerm>, unit_start: usize) -> bool {
         let item = reserved[unit_start];
         let order = item.order();
         let npages = reserved.dom().len();
         let end = unit_start + (1usize << order);
         &&& end <= usize::MAX + 1
         &&& !reserved.dom().is_empty()
-        &&& reserved.dom() =~= Set::new(|k| unit_start <= k < end)
+        &&& reserved.dom() =~= ISet::new(|k: usize| unit_start <= k < end)
         &&& item.is_head()
     }
 
@@ -201,8 +201,8 @@ impl PageInfoDb {
 
     /// When idx is the head of a unit, it returns the unit range.
     #[verifier(inline)]
-    spec fn dom_at(&self, idx: usize) -> Set<usize> {
-        set_usize_range(idx, idx + self@[idx].size())
+    spec fn dom_at(&self, idx: usize) -> ISet<usize> {
+        ISet::new(|k: usize| idx <= k < idx + self@[idx].size())
     }
 
     spec fn writable(&self) -> bool {
@@ -214,7 +214,7 @@ impl PageInfoDb {
     }
 
     spec fn marked_compound(
-        reserved: Map<usize, PInfoPerm>,
+        reserved: IMap<usize, PInfoPerm>,
         head_idx: usize,
         order: usize,
     ) -> bool {
@@ -261,7 +261,7 @@ impl PageInfoDb {
     /// - If the unit contains compound pages, they follow the head page
     ///   correctly and consistently.
     spec fn new_unit_requires(
-        reserved: Map<usize, PInfoPerm>,
+        reserved: IMap<usize, PInfoPerm>,
         id: PInfoGroupId,
         unit_start: usize,
         order: usize,
@@ -330,10 +330,10 @@ impl PageInfoDb {
     }
 
     spec fn empty(id: PInfoGroupId) -> PageInfoDb {
-        PageInfoDb { unit_start: 0, id, reserved: Map::empty() }
+        PageInfoDb { unit_start: 0, id, reserved: IMap::empty() }
     }
 
-    spec fn _info_dom(&self, order: usize) -> Set<usize> {
+    spec fn _info_dom(&self, order: usize) -> ISet<usize> {
         self@.dom().filter(|i| self@[i].order() == order && self@[i].is_head())
     }
 
@@ -343,7 +343,7 @@ impl PageInfoDb {
         self._info_dom(order).len()
     }
 
-    spec fn _info_head_dom(&self, order: usize) -> Set<usize> {
+    spec fn _info_head_dom(&self, order: usize) -> ISet<usize> {
         self@.dom().filter(|i| self@[i].order() == order && self@[i].is_head())
     }
 
@@ -381,7 +381,7 @@ impl PageInfoDb {
         let s3 = s2.map(r);
         assert forall|x1: usize, x2: usize| #[trigger] r(x1) == #[trigger] r(x2) implies x1
             == x2 by {}
-        vstd::set_lib::lemma_map_size(s2, s3, r);
+        vstd::iset_lib::lemma_map_size(s2, s3, r);
         assert forall|i| #[trigger] s3.contains(i) implies !s1.contains(i) && !s2.contains(i)
             && self.dom().contains(i) by {
             let head_i = (i - 1) as usize;
@@ -394,8 +394,8 @@ impl PageInfoDb {
             assert(!self.is_head(i));
         }
         assert(s1.disjoint(s2));
-        vstd::set_lib::lemma_set_disjoint_lens(s1, s2);
-        vstd::set_lib::lemma_set_disjoint_lens(s1 + s2, s3);
+        vstd::iset_lib::lemma_iset_disjoint_lens(s1, s2);
+        vstd::iset_lib::lemma_iset_disjoint_lens(s1 + s2, s3);
         let s = s1 + s2 + s3;
         assert(s.subset_of(self@.dom()));
     }
@@ -444,10 +444,6 @@ impl PageInfoDb {
         reveal(PageInfoDb::nr_page);
 
         assert(1usize << self@[self.unit_start()].order() == self.npages()) by {
-            lemma_set_usize_range(
-                self.unit_start,
-                self.unit_start + (1usize << self@[self.unit_start()].order()),
-            );
         }
         assert forall|order| #[trigger]
             self.nr_page(order) == Self::const_nr_page(self.npages(), order) by {
@@ -468,12 +464,11 @@ impl PageInfoDb {
     {
         reveal(PageInfoDb::nr_page);
         if order == self@[self.unit_start()].order() {
-            assert(self._info_dom(order) =~= set![self.unit_start]);
+            assert(self._info_dom(order) =~= iset![self.unit_start]);
             //assert(self._info_dom(order) =~= self@.dom());
         } else {
             assert(self._info_dom(order).is_empty());
         }
-        lemma_set_usize_range(self.unit_start, self.unit_start + (1usize << self.order()));
     }
 
     proof fn lemma_restrict(&self, idx: usize)
@@ -501,7 +496,7 @@ impl PageInfoDb {
         }
     }
 
-    spec fn new(unit_start: usize, id: PInfoGroupId, reserved: Map<usize, PInfoPerm>) -> Self {
+    spec fn new(unit_start: usize, id: PInfoGroupId, reserved: IMap<usize, PInfoPerm>) -> Self {
         PageInfoDb { unit_start, id, reserved }
     }
 
@@ -539,7 +534,7 @@ impl PageInfoDb {
         ensures
             ret == PageInfoDb::empty(id),
     {
-        let tracked reserved = Map::tracked_empty();
+        let tracked reserved = IMap::tracked_empty();
         PageInfoDb { unit_start: 0, id, reserved }
     }
 
@@ -569,8 +564,8 @@ impl PageInfoDb {
         let s1 = left._info_dom(order);
         let s2 = right._info_dom(order);
         let s = self._info_dom(order);
-        vstd::set_lib::lemma_set_disjoint_lens(left.dom(), right.dom());
-        vstd::set_lib::lemma_set_disjoint_lens(s1, s2);
+        vstd::iset_lib::lemma_iset_disjoint_lens(left.dom(), right.dom());
+        vstd::iset_lib::lemma_iset_disjoint_lens(s1, s2);
         assert(s1 + s2 =~= s);
     }
 
@@ -594,8 +589,7 @@ impl PageInfoDb {
         }
         let s = self.dom_at(i);
         assert(left.dom() + s =~= self@.dom());
-        vstd::set_lib::lemma_set_disjoint_lens(left.dom(), s);
-        lemma_set_usize_range(i, i + self@[i].size());
+        vstd::iset_lib::lemma_iset_disjoint_lens(left.dom(), s);
     }
 
     spec fn merge(&self, other: Self) -> Self {
@@ -678,8 +672,6 @@ impl PageInfoDb {
     {
         reveal(PageInfoDb::restrict);
         self.lemma_restrict(i);
-        lemma_set_usize_range(i, i + self@[i].size());
-        broadcast use lemma_set_usize_range;
 
         self.lemma_remove(i);
     }
@@ -738,12 +730,12 @@ impl PageInfoDb {
         order: usize,
         unit_start: usize,
         id: PInfoGroupId,
-        tracked reserved: Map<usize, PInfoPerm>,
+        tracked reserved: IMap<usize, PInfoPerm>,
     ) -> (tracked ret: Self)
         requires
             order < MAX_ORDER,
             unit_start + (1usize << order) <= usize::MAX + 1,
-            reserved.dom() =~= Set::new(|k| unit_start <= k < unit_start + (1usize << order)),
+            reserved.dom() =~= ISet::new(|k: usize| unit_start <= k < unit_start + (1usize << order)),
             reserved[unit_start].is_head(),
             reserved[unit_start].order() == order,
             PageInfoDb::new_unit_requires(reserved, id, unit_start, order),
@@ -755,7 +747,6 @@ impl PageInfoDb {
             forall|order| #[trigger] ret.nr_page(order) == Self::const_nr_page(ret.npages(), order),
     {
         reveal(PageInfoDb::restrict);
-        lemma_set_usize_range(unit_start, unit_start + (1usize << order));
         let tracked ret = PageInfoDb { unit_start, id, reserved };
         ret.proof_unit_nr_page();
         ret
@@ -845,12 +836,12 @@ impl PageInfoDb {
         order: usize,
         unit_start: usize,
         id: PInfoGroupId,
-        tracked reserved: Map<usize, PInfoPerm>,
+        tracked reserved: IMap<usize, PInfoPerm>,
     ) -> (tracked unit: PageInfoDb)
         requires
             order < MAX_ORDER,
             unit_start + (1usize << order) <= usize::MAX + 1,
-            reserved.dom() =~= Set::new(|k| unit_start <= k < unit_start + (1usize << order)),
+            reserved.dom() =~= ISet::new(|k| unit_start <= k < unit_start + (1usize << order)),
             reserved[unit_start].is_head(),
             reserved[unit_start].order() == order,
             PageInfoDb::new_unit_requires(reserved, id, unit_start, order),
@@ -971,7 +962,7 @@ impl PageInfoDb {
         self.reserved.tracked_borrow(idx)
     }
 
-    proof fn tracked_expose(tracked self) -> (tracked ret: Map<usize, PInfoPerm>)
+    proof fn tracked_expose(tracked self) -> (tracked ret: IMap<usize, PInfoPerm>)
         ensures
             ret == self.reserved,
             self.wf(),
