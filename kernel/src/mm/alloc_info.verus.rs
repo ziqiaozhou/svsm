@@ -12,10 +12,36 @@
 // shared status.
 use verify_proof::frac_ptr::tracked_map_merge_right_shares;
 use verify_proof::frac_ptr::tracked_map_shares;
-use verify_proof::set::set_usize_range;
 use vstd::raw_ptr::PtrData;
 
 verus! {
+
+/// Proves that the set of usizes in the range [lo, hi) is finite with length hi - lo.
+proof fn lemma_usize_range_finite(lo: usize, hi: int)
+    requires
+        lo <= hi <= usize::MAX + 1,
+    ensures
+        ISet::new(|k: usize| lo <= k < hi).finite(),
+        ISet::new(|k: usize| lo <= k < hi).len() == hi - lo,
+{
+    vstd::iset_lib::lemma_int_range(lo as int, hi);
+    let iset_int = vstd::iset_lib::set_int_range(lo as int, hi);
+    let iset_usize: ISet<usize> = ISet::new(|k: usize| lo <= k < hi);
+    // Map from the finite int range to the usize range
+    let g = |k: int| k as usize;
+    assert forall|k: int| iset_int.contains(k) implies iset_usize.contains(
+        #[trigger] g(k),
+    ) by {}
+    assert forall|k: usize| iset_usize.contains(k) implies iset_int.contains(k as int) by {}
+    assert(iset_int.map(g) =~= iset_usize) by {
+        assert forall|u: usize| iset_usize.contains(u) implies iset_int.map(g).contains(u) by {
+            assert(iset_int.contains(u as int));
+            assert(g(u as int) == u);
+        }
+    }
+    assert(iset_int.injective_on(g));
+    vstd::iset_lib::lemma_map_size(iset_int, iset_usize, g);
+}
 
 type PInfoPerm = FracTypedPerm<PageStorageType>;
 
@@ -314,6 +340,7 @@ impl PageInfoDb {
     /// The invariant of the `PageInfoDb`
     #[verifier::type_invariant]
     spec fn wf(&self) -> bool {
+        &&& self.dom().finite()
         &&& forall|idx: usize|
             #![trigger self@[idx]]
             self@.dom().contains(idx) && self@[idx].is_head() ==> {
@@ -372,6 +399,8 @@ impl PageInfoDb {
         let s2 = self._info_dom(order2);
         assert(order2 >= 1);
         assert((1usize << order2) > 1);
+        self.dom().lemma_len_filter(|i: usize| self@[i].order() == order && self@[i].is_head());
+        self.dom().lemma_len_filter(|i: usize| self@[i].order() == order2 && self@[i].is_head());
         let r = |i: usize|
             if i < usize::MAX {
                 (i + 1) as usize
@@ -395,9 +424,11 @@ impl PageInfoDb {
         }
         assert(s1.disjoint(s2));
         vstd::iset_lib::lemma_iset_disjoint_lens(s1, s2);
+        vstd::iset_lib::lemma_iset_union_finite_iff(s1, s2);
         vstd::iset_lib::lemma_iset_disjoint_lens(s1 + s2, s3);
         let s = s1 + s2 + s3;
         assert(s.subset_of(self@.dom()));
+        vstd::iset_lib::lemma_len_subset(s, self@.dom());
     }
 
     /// the number of page blocks with any given orders should be less than the
@@ -410,6 +441,7 @@ impl PageInfoDb {
     {
         reveal(PageInfoDb::nr_page);
         assert(self._info_dom(order).subset_of(self@.dom()));
+        vstd::iset_lib::lemma_len_subset(self._info_dom(order), self@.dom());
     }
 
     spec fn const_nr_page(npages: nat, order: usize) -> nat {
@@ -444,6 +476,10 @@ impl PageInfoDb {
         reveal(PageInfoDb::nr_page);
 
         assert(1usize << self@[self.unit_start()].order() == self.npages()) by {
+            let unit_start = self.unit_start();
+            let order = self@[unit_start].order();
+            let end = (unit_start + (1usize << order)) as int;
+            lemma_usize_range_finite(unit_start, end);
         }
         assert forall|order| #[trigger]
             self.nr_page(order) == Self::const_nr_page(self.npages(), order) by {
@@ -463,7 +499,11 @@ impl PageInfoDb {
             self.npages() == 1usize << (self@[self.unit_start()].order()),
     {
         reveal(PageInfoDb::nr_page);
-        if order == self@[self.unit_start()].order() {
+        let unit_start = self.unit_start();
+        let unit_order = self@[unit_start].order();
+        let end = (unit_start + (1usize << unit_order)) as int;
+        lemma_usize_range_finite(unit_start, end);
+        if order == unit_order {
             assert(self._info_dom(order) =~= iset![self.unit_start]);
             //assert(self._info_dom(order) =~= self@.dom());
         } else {
@@ -493,6 +533,11 @@ impl PageInfoDb {
         } else {
             assert(self.restrict(idx).is_unit());
             assert(self.restrict(idx).wf_unit());
+            // Prove finiteness of the restricted domain
+            let end = (idx + self@[idx].size()) as int;
+            lemma_usize_range_finite(idx, end);
+            assert(self.restrict(idx).dom().subset_of(self.dom()));
+            vstd::iset_lib::lemma_iset_subset_finite(self.dom(), self.restrict(idx).dom());
         }
     }
 
@@ -564,6 +609,12 @@ impl PageInfoDb {
         let s1 = left._info_dom(order);
         let s2 = right._info_dom(order);
         let s = self._info_dom(order);
+        assert(left.dom().subset_of(self.dom()));
+        assert(right.dom().subset_of(self.dom()));
+        vstd::iset_lib::lemma_iset_subset_finite(self.dom(), left.dom());
+        vstd::iset_lib::lemma_iset_subset_finite(self.dom(), right.dom());
+        left.dom().lemma_len_filter(|i: usize| left@[i].order() == order && left@[i].is_head());
+        right.dom().lemma_len_filter(|i: usize| right@[i].order() == order && right@[i].is_head());
         vstd::iset_lib::lemma_iset_disjoint_lens(left.dom(), right.dom());
         vstd::iset_lib::lemma_iset_disjoint_lens(s1, s2);
         assert(s1 + s2 =~= s);
@@ -575,6 +626,7 @@ impl PageInfoDb {
             self.dom().contains(i),
             self.is_head(i),
         ensures
+            self.remove(i).dom().finite(),
             self.remove(i).npages() == self.npages() - self@[i].size(),
             forall|j|
                 self.is_head(j) && i != j && self.dom().contains(j) ==> #[trigger] self.remove(
@@ -588,7 +640,12 @@ impl PageInfoDb {
             self.lemma_remove_restrict(i, j);
         }
         let s = self.dom_at(i);
+        lemma_usize_range_finite(i, (i + self@[i].size()) as int);
         assert(left.dom() + s =~= self@.dom());
+        assert(left.dom().subset_of(self.dom()));
+        assert(s.subset_of(self.dom()));
+        vstd::iset_lib::lemma_iset_subset_finite(self.dom(), left.dom());
+        vstd::iset_lib::lemma_iset_subset_finite(self.dom(), s);
         vstd::iset_lib::lemma_iset_disjoint_lens(left.dom(), s);
     }
 
@@ -613,6 +670,8 @@ impl PageInfoDb {
     {
         reveal(PageInfoDb::restrict);
         let new = self.merge(other);
+        assert(new.dom() =~= self.dom() + other.dom());
+        vstd::iset_lib::lemma_iset_union_finite_iff(self.dom(), other.dom());
 
         if !new.is_unit() {
             assert forall|idx: usize| #![trigger new@[idx]] new@.dom().contains(idx) implies {
@@ -672,8 +731,26 @@ impl PageInfoDb {
     {
         reveal(PageInfoDb::restrict);
         self.lemma_restrict(i);
-
         self.lemma_remove(i);
+        let removed = self.remove(i);
+        assert forall|idx: usize|
+            #![trigger removed@[idx]]
+            removed@.dom().contains(idx)
+        implies ({
+            let _ = self@[idx]; // fire self.wf() trigger
+            &&& removed@[idx] == self@[idx]
+            &&& (removed@[idx].is_head() ==> removed.restrict(idx).wf_unit())
+        })
+        by {
+            assert(self@.dom().contains(idx));
+            assert(removed@[idx] == self@[idx]);
+            if removed@[idx].is_head() {
+                assert(self.is_head(idx));
+                assert(i != idx);
+                assert(removed.restrict(idx) == self.restrict(idx));
+                assert(self.restrict(idx).wf_unit());
+            }
+        }
     }
 
     #[verifier(spinoff_prover)]
@@ -747,6 +824,7 @@ impl PageInfoDb {
             forall|order| #[trigger] ret.nr_page(order) == Self::const_nr_page(ret.npages(), order),
     {
         reveal(PageInfoDb::restrict);
+        lemma_usize_range_finite(unit_start, (unit_start + (1usize << order)) as int);
         let tracked ret = PageInfoDb { unit_start, id, reserved };
         ret.proof_unit_nr_page();
         ret
@@ -824,6 +902,7 @@ impl PageInfoDb {
         let tracked mut tmp = PageInfoDb::tracked_empty(arbitrary());
         tracked_swap(unit, &mut tmp);
         let tracked PageInfoDb { unit_start, mut reserved, mut id } = tmp;
+        use_type_invariant(&unit2);
         tracked_map_merge_right_shares(&mut reserved, unit2.reserved);
         id.shares = id.shares + unit2.id().shares;
         *unit = PageInfoDb::tracked_new_unit(order, unit_start, id, reserved);
@@ -921,6 +1000,7 @@ impl PageInfoDb {
         let tracked mut tmp = PageInfoDb::tracked_empty(arbitrary());
         tracked_swap(self, &mut tmp);
         let tracked PageInfoDb { unit_start, mut reserved, mut id } = tmp;
+        assert(reserved.dom().finite());
         let tracked new_reserved = tracked_map_shares(&mut reserved, shares);
         let mut ret_id = id;
         ret_id.shares = shares;
@@ -947,6 +1027,11 @@ impl PageInfoDb {
         use_type_invariant(self);
         use_type_invariant(other);
         use_type_invariant(&other.info);
+        assert(other.info.npages() > 0) by {
+            broadcast use vstd::iset_lib::lemma_iset_is_empty_len0;
+        }
+        assert(other.info.is_unit());
+        assert(other.info.dom().contains(pfn));
         self.reserved.tracked_borrow(pfn).is_same(other.info.reserved.tracked_borrow(pfn));
     }
 
