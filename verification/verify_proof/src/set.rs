@@ -25,7 +25,7 @@ pub proof fn lemma_usize_range_finite(lo: usize, hi: int)
     ) by {}
     assert forall|k: usize| iset_usize.contains(k) implies iset_int.contains(k as int) by {}
     assert(iset_int.map(g) =~= iset_usize) by {
-        assert forall|u: usize| iset_usize.contains(u) implies iset_int.map(g).contains(u) by {
+        assert forall|u: usize| #[trigger] iset_usize.contains(u) implies iset_int.map(g).contains(u) by {
             assert(iset_int.contains(u as int));
             assert(g(u as int) == u);
         }
