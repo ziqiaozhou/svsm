@@ -805,7 +805,7 @@ impl HeapMemoryRegion {
 
     /// Marks a compound page and updates page information for neighboring pages.
     #[verus_spec(
-        with Tracked(perms): Tracked<&mut Map<usize, PInfoPerm>>
+        with Tracked(perms): Tracked<&mut IMap<usize, PInfoPerm>>
         requires
             old(self).req_mark_compound_page(pfn, order, *old(perms)),
         ensures
@@ -838,7 +838,7 @@ impl HeapMemoryRegion {
     /// Initializes a compound page with given page frame numbers and order.
     #[verus_spec(
         with
-            Tracked(perms): Tracked<&mut Map<usize, PInfoPerm>>
+            Tracked(perms): Tracked<&mut IMap<usize, PInfoPerm>>
         requires
             old(self).req_init_compound_page(pfn, order, next_pfn, *old(perms)),
         ensures

@@ -34,16 +34,10 @@ mod alloc_spec { include!("alloc_inner.verus.rs");  }
 
 use alloc_spec::*;
 
-broadcast group set_len_group {
-    verify_proof::set::lemma_len_filter,
-    verify_proof::set::lemma_len_subset,
-}
-
 broadcast group alloc_broadcast_group {
     LinearMap::lemma_get_paddr,
     lemma_bit_usize_shl_values,
     lemma_page_size,
-    set_len_group,
     //lemma_bit_u64_and_bound,
     alloc_spec::lemma_compound_neighbor,
 }
@@ -101,7 +95,7 @@ impl HeapMemoryRegion {
             0 <= order < MAX_ORDER ==> info.nr_page(order) == (
             #[trigger] self.nr_pages[order as int])
         &&& self@.free.nr_free() =~= self.free_pages@
-        &&& info.dom() =~= Set::new(|idx| 0 <= idx < self.page_count)
+        &&& info.dom() =~= ISet::new(|idx| 0 <= idx < self.page_count)
         &&& self.page_count == self@.npages()
     }
 
@@ -170,7 +164,7 @@ impl HeapMemoryRegion {
         &self,
         pfn: usize,
         npage: usize,
-        perms: Map<usize, PInfoPerm>,
+        perms: IMap<usize, PInfoPerm>,
     ) -> bool {
         &&& forall|i| pfn <= i < pfn + npage ==> #[trigger] perms.contains_key(i)
         &&& forall|i|
@@ -196,7 +190,7 @@ impl HeapMemoryRegion {
         &self,
         pfn: usize,
         order: usize,
-        perms: Map<usize, PInfoPerm>,
+        perms: IMap<usize, PInfoPerm>,
     ) -> bool {
         let size = (1usize << order);
         &&& self.writable_page_infos((pfn + 1) as usize, (size - 1) as usize, perms)
@@ -209,8 +203,8 @@ impl HeapMemoryRegion {
         new: Self,
         pfn: usize,
         order: usize,
-        perms: Map<usize, PInfoPerm>,
-        new_perms: Map<usize, PInfoPerm>,
+        perms: IMap<usize, PInfoPerm>,
+        new_perms: IMap<usize, PInfoPerm>,
     ) -> bool {
         self.ens_mark_compound_page_loop(new, pfn, 1usize << order, order, perms, new_perms)
     }
@@ -221,8 +215,8 @@ impl HeapMemoryRegion {
         pfn: usize,
         size: usize,
         order: usize,
-        perms: Map<usize, PInfoPerm>,
-        new_perms: Map<usize, PInfoPerm>,
+        perms: IMap<usize, PInfoPerm>,
+        new_perms: IMap<usize, PInfoPerm>,
     ) -> bool {
         let pi = PageInfo::Compound(CompoundInfo { order });
         &&& *self == new
@@ -241,7 +235,7 @@ impl HeapMemoryRegion {
         pfn: usize,
         order: usize,
         next_pfn: usize,
-        perms: Map<usize, PInfoPerm>,
+        perms: IMap<usize, PInfoPerm>,
     ) -> bool {
         &&& spec_pfn_inv(next_pfn)
         &&& self.inbound_pfn_order(pfn, order)
@@ -255,8 +249,8 @@ impl HeapMemoryRegion {
         pfn: usize,
         order: usize,
         next_pfn: usize,
-        perms: Map<usize, PInfoPerm>,
-        new_perms: Map<usize, PInfoPerm>,
+        perms: IMap<usize, PInfoPerm>,
+        new_perms: IMap<usize, PInfoPerm>,
     ) -> bool {
         let size = 1usize << order;
         let pi = PageInfo::Free(FreeInfo { next_page: next_pfn, order });
@@ -640,7 +634,7 @@ macro_rules! lemma_split_pre {
             use_type_invariant(&$perm.info);
             grant_info_write!($mr, $perm => $mem, $reserved2, $id);
 
-            let tracked mut $reserved = $reserved2.tracked_remove_keys(Set::new(|i: usize| $pfn1 <= i < $pfn2));
+            let tracked mut $reserved = $reserved2.tracked_remove_keys(ISet::new(|i: usize| $pfn1 <= i < $pfn2));
 
             // Prove the next page is valid.
             $mr.perms.borrow().free.tracked_next($new_order);
