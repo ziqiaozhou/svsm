@@ -9,9 +9,9 @@ set -e
 trap 'echo "Error at line $LINENO: $BASH_COMMAND"' ERR
 
 # Verus release version and commit hash
-VERUS_VERSION=0.2026.04.12.f1166c4
-VERUS_REV=f1166c42c3decd42c1cca2916ef2880d27cfb7d9
-VERUS_RUST_VERSION=1.94.0
+VERUS_VERSION=0.2026.06.07.cd03505
+VERUS_REV=cd0350583e528acb7367d56dc0e5a23f6336fe63
+VERUS_RUST_VERSION=1.96.0
 
 # Verusfmt version and commit hash
 VERUSFMT_VERSION=v0.5.7
