@@ -686,7 +686,10 @@ impl PageInfoDb {
         assert forall|idx: usize| #![trigger removed@[idx]] removed@.dom().contains(idx) implies {
             &&& removed@[idx] == self@[idx]
             &&& removed@[idx].is_head() ==> removed.restrict(idx).wf_unit()
+            &&& removed.wf_follows(idx)
+            &&& removed.wf_basic(idx)
         } by {
+            assert(self.wf_follows(idx) && self.wf_basic(idx));
             if removed@[idx].is_head() {
                 self.lemma_remove_restrict(i, idx);
             }
