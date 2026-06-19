@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright (c) Microsoft Corporation
+//
+// Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
 
 //! Generic paging traits and marker types.
 
 use crate::address::{Address, PhysAddr, VirtAddr};
+use crate::sizes::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M};
+use crate::tlb::TlbOps;
 use bitflags::Flags;
 use zerocopy::FromBytes;
 
@@ -27,6 +33,19 @@ impl PageLevel {
             Self::Level2 => Some(Self::Level1),
             Self::Level1 => Some(Self::Level0),
             Self::Level0 => None,
+        }
+    }
+
+    /// Size in bytes of the page mapped by a leaf entry at this level.
+    ///
+    /// `Level0` → 4 KiB, `Level1` → 2 MiB, `Level2` → 1 GiB,
+    /// `Level3` → 512 GiB.
+    pub fn page_size(self) -> usize {
+        match self {
+            Self::Level0 => PAGE_SIZE,
+            Self::Level1 => PAGE_SIZE_2M,
+            Self::Level2 => PAGE_SIZE_1G,
+            Self::Level3 => 512 * PAGE_SIZE_1G,
         }
     }
 }
@@ -79,8 +98,9 @@ pub enum PagingError {
 ///   for private (encrypted) mappings.
 /// * [`shared_pte_mask`](Self::shared_pte_mask) — bitmask ORed into PTEs
 ///   for shared (plaintext) mappings.
-/// * [`flush_tlb_global`](Self::flush_tlb_global) — flush the TLB on all
-///   CPUs; called after splitting or changing the encryption state of a page.
+/// * [`flush_tlb_global_sync`](TlbOps::flush_tlb_global_sync) (via the
+///   [`TlbOps`] supertrait) — flush the TLB on all CPUs; called after
+///   splitting or changing the encryption state of a page.
 ///
 /// # Default methods
 ///
@@ -95,7 +115,7 @@ pub enum PagingError {
 /// * `private_pte_mask` and `shared_pte_mask` must not share any set bits —
 ///   a page is either private *or* shared.
 /// * `make_private_address` and `make_shared_address` must be idempotent.
-pub trait ArchPagingMeta: 'static + Copy {
+pub trait ArchPagingMeta: 'static + Copy + TlbOps {
     type PTFlags: GenericPageTableFlags;
 
     /// Returns the bitmask ORed into physical addresses for private
@@ -109,12 +129,6 @@ pub trait ArchPagingMeta: 'static + Copy {
     /// Physical address mask.
     /// x64 supports 52-bit physical addresses, so the mask is usually 0x000f_ffff_ffff_f000.
     fn address_mask() -> usize;
-
-    /// Flush the TLB globally and synchronize across all CPUs.
-    ///
-    /// Called after modifying live PTEs (e.g., splitting a 2M page or
-    /// toggling the encryption state of a mapping).
-    fn flush_tlb_global();
 
     /// Returns a bitmask of PTEntryFlags that the hardware supports.
     ///

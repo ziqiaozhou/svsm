@@ -80,10 +80,10 @@ pub unsafe fn expand_kernel_heap(
     // this must be done manually.
     let pdpe_vaddr = VirtAddr::from(u64::from(pml4e.address()) + phys_virt_diff);
 
-    // Capture a reference to the page directory table page.
-    // SAFETY: the virtual address calculated above is correct because the page
-    // table hierarchy is correct at this point.
-    let pdpt = unsafe { PTPage::from_vaddr(pdpe_vaddr) };
+    // Capture a raw pointer to the (live) page directory pointer table page.
+    // `from_vaddr` cannot be used here: the table is installed, so it must be
+    // accessed through the volatile element accessors rather than a `&mut`.
+    let pdpt = pdpe_vaddr.as_mut_ptr::<PTPage>();
 
     // Calculate the page table entry flags that will be used for intermediate
     // entries and for leaf entries.
@@ -114,7 +114,11 @@ pub unsafe fn expand_kernel_heap(
         if pdt_vaddr == VirtAddr::null() {
             // Calculate the address of the page directory page that will
             // contain the large page PDE, allocating pages if necessary.
-            let pdpe = &mut pdpt[PageTable::index::<2>(vaddr)];
+            let pdpe_index = PageTable::index::<2>(vaddr);
+            // SAFETY: `pdpt` points at the live page directory pointer table
+            // and `pdpe_index < ENTRY_COUNT`. A volatile read forms no
+            // reference into the live frame.
+            let mut pdpe = unsafe { PTPage::read_entry_at(pdpt, pdpe_index) };
             if !pdpe.present() {
                 // Allocate a new page to use as the page directory page.
                 let new_pdpe_paddr = heap_phys_start + allocated_pages * PAGE_SIZE;
@@ -130,17 +134,24 @@ pub unsafe fn expand_kernel_heap(
                 }
 
                 pdpe.set(make_private_address(new_pdpe_paddr), pxe_flags);
+                // SAFETY: as above; publish the new PDPE via a volatile write.
+                unsafe { PTPage::write_entry_at(pdpt, pdpe_index, pdpe) };
             }
             pdt_vaddr = VirtAddr::from(u64::from(pdpe.address()) + phys_virt_diff);
         }
 
-        // SAFETY: the virtual address of the page directory table page was
-        // just calculated above or was previous valid, so it can be used
-        // to obatain a reference to a `PTPage` here.
-        let pdt = unsafe { PTPage::from_vaddr(pdt_vaddr) };
+        // Raw pointer to the (live) page directory page; accessed via the
+        // volatile element accessors, not a `&mut`.
+        let pdt = pdt_vaddr.as_mut_ptr::<PTPage>();
 
         // Fill in the PDE for the next direct map address in sequence.
-        pdt[pde_index].set(make_private_address(paddr), pte_flags);
+        // SAFETY: `pdt` points at the live page directory and
+        // `pde_index < ENTRY_COUNT`; the volatile read/write form no
+        // reference into the live frame.
+        let mut pde = unsafe { PTPage::read_entry_at(pdt, pde_index) };
+        pde.set(make_private_address(paddr), pte_flags);
+        // SAFETY: as above.
+        unsafe { PTPage::write_entry_at(pdt, pde_index, pde) };
 
         // By the time kernel region expansion is performed, the heap area has
         // been fully validated.  Now that a new large page has been added,

@@ -251,10 +251,18 @@ impl VMR {
 
         while vmm_start + offset < vmm_end {
             let idx = PageTable::index::<3>(VirtAddr::from(vmm_start - rstart));
-            let result = match page_size {
+            let (result, flush) = match page_size {
                 PageSize::Regular => pgtbl_parts[idx].unmap_4k(vmm_start + offset),
                 PageSize::Huge => pgtbl_parts[idx].unmap_2m(vmm_start + offset),
             };
+
+            // Callers flush the affected range after unmapping: `remove`
+            // issues a per-CPU or broadcast range flush, and the `do_insert`
+            // rollback path tears down a just-created (not yet broadcast)
+            // mapping. Discharge the per-page obligation accordingly.
+            if let Some(flush) = flush {
+                flush.ignore("VMRange callers flush the whole range after unmap_vmm");
+            }
 
             if result.is_some() {
                 mapping.unmap(offset);
