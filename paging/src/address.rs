@@ -5,6 +5,7 @@
 // Author: Carlos López <carlos.lopez@suse.com>
 
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE};
+use crate::traits::PagingLevel;
 use crate::util::{align_down, align_up, is_aligned};
 
 use core::fmt;
@@ -348,6 +349,17 @@ impl VirtAddr {
     )]
     pub const fn to_pgtbl_idx<const L: usize>(&self) -> usize {
         (self.0 >> (12 + L * 9)) & 0x1ffusize
+    }
+
+    /// Returns the index into page-table pages of given levels.
+    #[verus_spec(ret =>
+        requires
+            L::TOP_LEVEL < 5,
+        ensures
+            self.pgtbl_idx_ensures(L, ret)
+    )]
+    pub const fn to_pgtbl_idx_by_level<L: PagingLevel>(&self) -> usize {
+        (self.0 >> (12 + L::TOP_LEVEL as usize * 9)) & 0x1ffusize
     }
 
     #[inline]

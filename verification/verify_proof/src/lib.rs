@@ -21,6 +21,8 @@ pub mod nonlinear;
 pub mod set;
 #[cfg(verus_keep_ghost)]
 pub mod sum;
+#[cfg(verus_keep_ghost)]
+pub mod memory;
 
 verus! {
 

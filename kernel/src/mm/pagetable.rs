@@ -332,6 +332,8 @@ type RawPageTablePart = GenericPageTable<SvsmPaging, SvsmPaging, PdptLevel>;
 #[derive(Debug, FromZeros)]
 pub struct PageTable(SvsmPageTable);
 
+pub type ActivePageTable = ActivePageTableNode<SvsmPaging, SvsmPaging, Pml4Level>;
+
 impl Deref for PageTable {
     type Target = SvsmPageTable;
     fn deref(&self) -> &Self::Target {
@@ -592,7 +594,7 @@ impl PageTable {
         let Some(paddr) = part.address() else {
             return false;
         };
-        let idx = part.index();
+        let idx: usize = part.index();
         let flags = PTEntryFlags::PRESENT
             | PTEntryFlags::WRITABLE
             | PTEntryFlags::USER
