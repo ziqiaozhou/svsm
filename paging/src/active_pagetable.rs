@@ -1,5 +1,4 @@
 use core::marker::PhantomData;
-use core::ptr::NonNull;
 
 use crate::address::{PhysAddr, VirtAddr};
 use crate::pagetable::{GenericPageTable, Mapping, PTEntry, PTPage};
@@ -10,9 +9,7 @@ use crate::traits::{
 
 #[cfg(feature = "ignore_ad")]
 unsafe fn ptr_read<T: Copy>(ptr: *const T) -> T {
-    unsafe {
-        *ptr
-    }
+    unsafe { *ptr }
 }
 
 #[cfg(not(feature = "ignore_ad"))]
@@ -121,6 +118,24 @@ impl<A: ArchPagingMeta + TlbOps> ActiveMapping<A> {
         // SAFETY: A valid ActiveMapping must point to a valid PTEntry.
         unsafe { read_entry(self.entry) }
     }
+
+    /// The level at which the walk that produced this mapping terminated.
+    pub fn level(self) -> PageLevel {
+        self.level
+    }
+}
+
+/// The root of an *active* (installed) page table.
+///
+/// Provides a raw pointer to the root [`PTPage`]. The pointer is `*mut`
+/// because an active table is mutated in place through volatile writes; it
+/// must never be turned into a `&PTPage`/`&mut PTPage` reference.
+///
+/// # Safety
+/// `root_ptr` must return a valid, page-aligned pointer to a live root
+/// page-table page that remains valid for the lifetime of the implementor.
+pub unsafe trait PageTableRoot<A: ArchPagingMeta, P: PagingHandler> {
+    fn root_pa(&self) -> PhysAddr;
 }
 
 /// An active page table, which is a page table that is currently in use.
@@ -132,12 +147,19 @@ impl<A: ArchPagingMeta + TlbOps> ActiveMapping<A> {
 /// volatile read/write of a *local* [`PTEntry`] copy; this type never forms
 /// a `&PTPage`, `&PTEntry`, or `&mut` reference into the installed table.
 #[derive(Debug)]
-pub struct ActivePageTableNode<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> {
-    root: NonNull<PTPage<A, P>>,
-    _level: PhantomData<L>,
+pub struct ActivePageTableNode<
+    R: PageTableRoot<A, P>,
+    A: ArchPagingMeta + TlbOps,
+    P: PagingHandler,
+    L: PagingLevel,
+> {
+    root: R,
+    _level: PhantomData<(A, P, L)>,
 }
 
-impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTableNode<A, P, L> {
+impl<R: PageTableRoot<A, P>, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel>
+    ActivePageTableNode<R, A, P, L>
+{
     /// Wrap the installed page table rooted at `root`.
     ///
     /// # Safety
@@ -145,7 +167,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     /// `L::TOP_LEVEL` hierarchy and that remains valid for the lifetime of
     /// the returned node. The caller must also coordinate updates if the
     /// table (or any sub-tree) is shared with other page tables.
-    pub unsafe fn new(root: NonNull<PTPage<A, P>>) -> Self {
+    pub unsafe fn new(root: R) -> Self {
         Self {
             root,
             _level: PhantomData,
@@ -215,7 +237,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     /// The walk descends through present, non-huge entries and stops at the
     /// leaf (`Level0`), at the first absent entry, or at a huge entry.
     fn walk_addr_raw(&self, vaddr: VirtAddr) -> ActiveMapping<A> {
-        let root = self.root.as_ptr();
+        let root = P::paddr_to_vaddr(self.root.root_pa()).as_mut_ptr();
         match L::TOP_LEVEL {
             PageLevel::Level3 => Self::walk_addr_lvl3(root, vaddr),
             PageLevel::Level2 => Self::walk_addr_lvl2(root, vaddr),
@@ -239,6 +261,56 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
             },
             m,
         )
+    }
+
+    pub fn cr3_value(&self) -> PhysAddr {
+        self.root.root_pa()
+    }
+
+    /// Walk the installed table for `vaddr`, returning the [`ActiveMapping`]
+    /// (level and raw entry pointer) at which the walk terminated.
+    pub fn walk(&self, vaddr: VirtAddr) -> ActiveMapping<A> {
+        self.walk_addr_raw(vaddr)
+    }
+
+    /// Return the [`ActiveMapping`] for the top-level entry at index `idx`.
+    ///
+    /// Used to read or update a single root-table entry (e.g. linking a
+    /// sub-tree) without walking a virtual address.
+    fn top_entry(&self, idx: usize) -> ActiveMapping<A> {
+        let root: *mut PTPage<A, P> = P::paddr_to_vaddr(self.root.root_pa()).as_mut_ptr();
+        ActiveMapping {
+            level: L::TOP_LEVEL,
+            entry: PTPage::entry_ptr(root, idx),
+        }
+    }
+
+    pub fn copy_entry_to(&self, other: &mut GenericPageTable<A, P, L>, idx: usize) {
+        let entry = self.top_entry(idx).read();
+        other.set_entry(idx, entry.paddr_field(), entry.flags());
+    }
+
+    /// Set the entry at the specified index.
+    ///
+    /// Returns `true` if the entry was updated, `false` otherwise.
+    pub fn set_entry(&mut self, idx: usize, paddr: PhysAddr, flags: A::PTFlags) -> bool {
+        let mut desired = PTEntry::empty();
+        desired.set(A::make_private_address(paddr), flags);
+        let mapping = self.top_entry(idx);
+        if mapping.read().raw() == desired.raw() {
+            return false;
+        }
+        mapping
+            .update(desired)
+            .ignore("populating a new sub-tree does not require a TLB flush");
+        true
+    }
+
+    /// Translate `vaddr` to a physical address through the installed table.
+    pub fn phys_addr(&self, vaddr: VirtAddr) -> Result<PhysAddr, PagingError> {
+        let mut entry = PTEntry::empty();
+        let (mapping, _active_m) = self.walk_addr(vaddr, &mut entry);
+        GenericPageTable::<A, P, L>::get_phys_addr(mapping, vaddr)
     }
 
     /// Maps a 4 KiB page, allocating parent tables with `parent_flags`.

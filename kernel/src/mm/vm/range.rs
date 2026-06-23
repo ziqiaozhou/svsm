@@ -8,7 +8,7 @@ use crate::address::{Address, VirtAddr};
 use crate::cpu::{flush_tlb_global_percpu, flush_tlb_global_sync_range};
 use crate::error::SvsmError;
 use crate::locking::RWLock;
-use crate::mm::pagetable::{PTEntryFlags, PageTable, PageTablePart};
+use crate::mm::pagetable::{ActivePageTable, PTEntryFlags, PageTable, PageTablePart};
 use crate::mm::virt_from_idx;
 use crate::types::{PAGE_SHIFT, PAGE_SIZE, PageSize};
 use crate::utils::{MemoryRegion, align_down, align_up};
@@ -138,7 +138,20 @@ impl VMR {
         }
     }
 
-    fn populate_addr(&self, pgtbl: &mut PageTable, vaddr: VirtAddr) -> Result<(), SvsmError> {
+    /// Populate [`PageTablePart`]s of the [`VMR`] into a page-table
+    ///
+    /// # Arguments
+    ///
+    /// * `pgtbl` - A [`PageTable`] pointing to the target page-table
+    pub fn populate_active(&self, pgtbl: &mut ActivePageTable) {
+        let parts = self.pgtbl_parts.lock_read();
+
+        for part in parts.iter() {
+            pgtbl.populate_pgtbl_part(part);
+        }
+    }
+
+    fn populate_addr(&self, pgtbl: &mut ActivePageTable, vaddr: VirtAddr) -> Result<(), SvsmError> {
         let vregion = self.virt_range();
         if !vregion.contains(vaddr) {
             return Err(SvsmError::Mem);
@@ -488,7 +501,7 @@ impl VMR {
     /// 'SvsmError::Mem' if the page fault should propogate to the next handler.
     pub fn handle_page_fault(
         &self,
-        pgtable: &mut PageTable,
+        pgtable: &mut ActivePageTable,
         vaddr: VirtAddr,
         write: bool,
     ) -> Result<(), SvsmError> {

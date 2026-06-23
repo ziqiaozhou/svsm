@@ -14,7 +14,8 @@
 //! ARM64 with 4 KiB granule. Other granule sizes (16 KiB, 64 KiB on
 //! ARM64) are not supported.
 
-use crate::active_pagetable::ActiveMapping;
+use super::active_pagetable::ActivePageTableNode;
+use crate::active_pagetable::PageTableRoot;
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
 pub use crate::traits::{
@@ -586,6 +587,14 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         Mapping::new(PageLevel::Level0, &mut page[idx])
     }
 
+    /// Allocates a 4KB page table entry for a given virtual address.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address for which to allocate the PTE.
+    /// - `parent_flags`: The flags to apply to the allocated page table entries.
+    ///
+    /// # Returns
+    /// A `Mapping` representing the allocated or existing PTE for the address.
     fn do_alloc_pte_4k(
         map: Mapping<'_, A>,
         vaddr: VirtAddr,
@@ -603,19 +612,6 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
                 Self::alloc_pte_lvl3(map.entry, vaddr, PageSize::Regular, parent_flags)
             }
         }
-    }
-
-    /// Allocates a 4KB page table entry for a given virtual address.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address for which to allocate the PTE.
-    /// - `parent_flags`: The flags to apply to the allocated page table entries.
-    ///
-    /// # Returns
-    /// A `Mapping` representing the allocated or existing PTE for the address.
-    fn alloc_pte_4k(&mut self, vaddr: VirtAddr, parent_flags: A::PTFlags) -> Mapping<'_, A> {
-        let m = self.walk_addr(vaddr);
-        Self::do_alloc_pte_4k(m, vaddr, parent_flags)
     }
 
     /// Allocates a 2MB page table entry for a given virtual address.
@@ -693,9 +689,9 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// # Parameters
     /// - `mapping`: The mapping to split.
     /// - `vaddr`: The virtual address for which to split the page.
-    /// 
+    ///
     /// # Returns
-    /// A result containing the updated mapping for the virtual address, or an error 
+    /// A result containing the updated mapping for the virtual address, or an error
     /// [`PagingError`] in failure.
     fn split_4k_for(
         mapping: Mapping<'_, A>,

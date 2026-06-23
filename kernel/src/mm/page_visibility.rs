@@ -60,8 +60,8 @@ pub unsafe fn make_page_shared(vaddr: VirtAddr) -> Result<(), SvsmError> {
     this_cpu()
         .get_pgtable()
         .set_shared_4k(vaddr)
-        .expect("Failed to remap shared page in page tables");
-    flush_tlb_global_sync_page(vaddr, PageSize::Regular);
+        .expect("Failed to remap shared page in page tables")
+        .flush_tlb_global_sync_page(vaddr, PageSize::Regular);
 
     Ok(())
 }
@@ -79,8 +79,10 @@ pub unsafe fn make_page_shared(vaddr: VirtAddr) -> Result<(), SvsmError> {
 /// No outstanding references to the page may exist.
 pub unsafe fn make_page_private(vaddr: VirtAddr) -> Result<(), SvsmError> {
     // Update the page tables to map the page as private.
-    this_cpu().get_pgtable().set_encrypted_4k(vaddr)?;
-    flush_tlb_global_sync_page(vaddr, PageSize::Regular);
+    this_cpu()
+        .get_pgtable()
+        .set_encrypted_4k(vaddr)?
+        .flush_tlb_global_sync_page(vaddr, PageSize::Regular);
 
     // Ask the hypervisor to make the page private.
     let paddr = virt_to_phys(vaddr);

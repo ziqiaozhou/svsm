@@ -29,7 +29,7 @@ use crate::cpu::{ShadowStackInit, X86ExceptionContext, X86GeneralRegs, irqs_enab
 use crate::error::SvsmError;
 use crate::fs::{Directory, FileHandle, opendir, stdout_open};
 use crate::locking::{RWLock, SpinLock};
-use crate::mm::pagetable::{PTEntryFlags, PageTable};
+use crate::mm::pagetable::{ActivePageTable, PTEntryFlags};
 use crate::mm::vm::{Mapping, VMFileMappingFlags, VMKernelStack, VMR};
 use crate::mm::{
     PageBox, SVSM_PERTASK_BASE, SVSM_PERTASK_END, USER_MEM_END, USER_MEM_START, VMMappingGuard,
@@ -260,7 +260,7 @@ pub struct Task {
     pub shadow_stack_base: VirtAddr,
 
     /// Page table that is loaded when the task is scheduled
-    pub page_table: SpinLock<PageBox<PageTable>>,
+    pub page_table: SpinLock<ActivePageTable>,
 
     /// Task kernel stack mapping
     _kernel_stack: TaskKernelMapping,
@@ -435,6 +435,11 @@ impl Task {
         // Stack frames should be 16b-aligned
         debug_assert!(bounds.end().is_aligned(16));
 
+        // The page table is stored for future use, where it may become the
+        // active page table; treat it as active from now on.
+        // SAFETY: `pgtable` is a freshly allocated page table that is owned by
+        // this task and becomes the active table when the task is scheduled.
+        let pgtable = unsafe { ActivePageTable::new(pgtable) };
         Ok(Arc::new(Task {
             rsp: bounds
                 .end()

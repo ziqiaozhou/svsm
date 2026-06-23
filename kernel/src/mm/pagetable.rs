@@ -35,6 +35,8 @@ pub use paging::pagetable::{
 };
 pub use paging::x86_64::{PTEntryFlags, PdptLevel, Pml4Level};
 
+use paging::active_pagetable::{ActivePageTableNode, PageTableRoot};
+
 /// Mask for private page table entry.
 static PRIVATE_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::uninit();
 
@@ -138,6 +140,41 @@ impl ArchPagingMeta for SvsmPaging {
 
     fn supported_flags() -> PTEntryFlags {
         *FEATURE_MASK
+    }
+}
+
+// SAFETY trait: stateless TLB hooks dispatching to the kernel's `cpu::tlb`
+// free functions; used to discharge `MayNeedFlush` obligations.
+impl paging::tlb::TlbOps for SvsmPaging {
+    fn flush_tlb_global_sync() {
+        crate::cpu::flush_tlb_global_sync();
+    }
+
+    fn flush_tlb_global_sync_page(vaddr: VirtAddr, page_size: PageSize) {
+        crate::cpu::flush_tlb_global_sync_page(vaddr, page_size);
+    }
+
+    fn flush_tlb_global_sync_range(start: VirtAddr, len: usize, page_size: PageSize) {
+        crate::cpu::flush_tlb_global_sync_range(MemoryRegion::new(start, len), page_size);
+    }
+
+    fn flush_tlb_global_percpu() {
+        crate::cpu::flush_tlb_global_percpu();
+    }
+
+    fn flush_tlb_percpu() {
+        crate::cpu::flush_tlb_percpu();
+    }
+
+    fn flush_address_percpu(vaddr: VirtAddr) {
+        crate::cpu::flush_address_percpu(vaddr);
+    }
+
+    fn flush_range_percpu(start: VirtAddr, len: usize, page_size: PageSize) {
+        let region = MemoryRegion::new(start, len);
+        for page in region.iter_pages(page_size) {
+            crate::cpu::flush_address_percpu(page);
+        }
     }
 }
 
@@ -332,7 +369,219 @@ type RawPageTablePart = GenericPageTable<SvsmPaging, SvsmPaging, PdptLevel>;
 #[derive(Debug, FromZeros)]
 pub struct PageTable(SvsmPageTable);
 
-pub type ActivePageTable = ActivePageTableNode<SvsmPaging, SvsmPaging, Pml4Level>;
+// SAFETY: `root_pa` returns the physical address of the page table's root
+// page, which is page-aligned and remains valid while the box is alive.
+unsafe impl PageTableRoot<SvsmPaging, SvsmPaging> for PageBox<PageTable> {
+    fn root_pa(&self) -> PhysAddr {
+        virt_to_phys(self.vaddr())
+    }
+}
+
+type SvsmActivePageTable =
+    ActivePageTableNode<PageBox<PageTable>, SvsmPaging, SvsmPaging, Pml4Level>;
+/// An *active* (installed, or about-to-be-installed) page table.
+///
+/// Once a [`PageBox<PageTable>`] is stored for later use (per-CPU or
+/// per-task), it must be assumed to be concurrently walked by the MMU.
+/// All entry accesses therefore go through [`ActivePageTableNode`], which
+/// uses volatile raw-pointer reads/writes and never forms a `&PTPage`/
+/// `&PTEntry` reference into the live table.
+///
+/// Uninstalled page tables are built through [`PageTable`] (and its
+/// [`GenericPageTable`] methods) and wrapped into an `ActivePageTable` via
+/// [`ActivePageTable::new`] when they are stored.
+#[derive(Debug)]
+pub struct ActivePageTable {
+    node: SvsmActivePageTable,
+}
+
+impl ActivePageTable {
+    /// Wrap an (about-to-be) installed page table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `pgtable` is (or is about to become) the active
+    /// page table and remains valid for the lifetime of the returned value.
+    pub unsafe fn new(pgtable: PageBox<PageTable>) -> Self {
+        // SAFETY: delegated to the caller.
+        let node = unsafe { ActivePageTableNode::new(pgtable) };
+        Self { node }
+    }
+
+    /// Load this page table into the CR3 register.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure to take other actions to make sure a memory safe
+    /// execution state is warranted (e.g. changing the stack and register state)
+    pub unsafe fn load(&self) {
+        // SAFETY: demanded to the caller
+        unsafe {
+            write_cr3(self.cr3_value());
+        }
+    }
+
+    /// Clone the shared part of the page table into a fresh, uninstalled
+    /// page table; excluding the private parts.
+    ///
+    /// # Errors
+    /// Returns [`SvsmError`] if the page cannot be allocated.
+    pub fn clone_shared(&self) -> Result<PageBox<PageTable>, SvsmError> {
+        let mut pgtable = PageTable::allocate_new()?;
+        self.copy_entry_to(&mut pgtable, PGTABLE_LVL3_IDX_SHARED);
+        Ok(pgtable)
+    }
+
+    /// Maps a region of memory using 4KB pages. See [`PageTable::map_region_4k`].
+    pub fn map_region_4k(
+        &mut self,
+        vregion: MemoryRegion<VirtAddr>,
+        phys: PhysAddr,
+        flags: PTEntryFlags,
+        shared: bool,
+    ) -> Result<(), SvsmError> {
+        for addr in vregion.iter_pages(PageSize::Regular) {
+            let offset = addr - vregion.start();
+            self.map_4k(addr, phys + offset, flags, shared)?;
+        }
+        Ok(())
+    }
+
+    /// Maps a region of memory using 2MB pages. See [`PageTable::map_region_2m`].
+    pub fn map_region_2m(
+        &mut self,
+        vregion: MemoryRegion<VirtAddr>,
+        phys: PhysAddr,
+        flags: PTEntryFlags,
+        shared: bool,
+    ) -> Result<(), SvsmError> {
+        for addr in vregion.iter_pages(PageSize::Huge) {
+            let offset = addr - vregion.start();
+            self.node.map_2m(addr, phys + offset, flags, shared)?;
+        }
+        Ok(())
+    }
+
+    /// Maps a memory region, choosing 2MB or 4KB pages. See [`PageTable::map_region`].
+    pub fn map_region(
+        &mut self,
+        region: MemoryRegion<VirtAddr>,
+        phys: PhysAddr,
+        flags: PTEntryFlags,
+    ) -> Result<(), SvsmError> {
+        let mut vaddr = region.start();
+        let end = region.end();
+        let mut paddr = phys;
+
+        while vaddr < end {
+            if vaddr.is_aligned(PAGE_SIZE_2M)
+                && paddr.is_aligned(PAGE_SIZE_2M)
+                && vaddr + PAGE_SIZE_2M <= end
+                && self.node.map_2m(vaddr, paddr, flags, false).is_ok()
+            {
+                vaddr = vaddr + PAGE_SIZE_2M;
+                paddr = paddr + PAGE_SIZE_2M;
+                continue;
+            }
+
+            self.map_4k(vaddr, paddr, flags, false)?;
+            vaddr = vaddr + PAGE_SIZE;
+            paddr = paddr + PAGE_SIZE;
+        }
+
+        Ok(())
+    }
+
+    /// Unmaps a region of 4KB pages. See [`PageTable::unmap_region_4k`].
+    pub fn unmap_region_4k(&mut self, vregion: MemoryRegion<VirtAddr>) {
+        for addr in vregion.iter_pages(PageSize::Regular) {
+            if let Some((_, flush)) = self.node.unmap_4k(addr) {
+                flush.ignore("caller flushes the TLB explicitly");
+            }
+        }
+    }
+
+    /// Unmaps a region of 2MB pages. See [`PageTable::unmap_region_2m`].
+    pub fn unmap_region_2m(&mut self, vregion: MemoryRegion<VirtAddr>) {
+        for addr in vregion.iter_pages(PageSize::Huge) {
+            if let Some((_, flush)) = self.node.unmap_2m(addr) {
+                flush.ignore("caller flushes the TLB explicitly");
+            }
+        }
+    }
+
+    /// Populates this page table with the contents of the given subtree in
+    /// `part`. See [`PageTable::populate_pgtbl_part`].
+    ///
+    /// Returns `true` if the PTE contents were updated.
+    pub fn populate_pgtbl_part(&mut self, part: &PageTablePart) -> bool {
+        let Some(paddr) = part.address() else {
+            return false;
+        };
+        let idx: usize = part.index();
+        let flags = PTEntryFlags::PRESENT
+            | PTEntryFlags::WRITABLE
+            | PTEntryFlags::USER
+            | PTEntryFlags::ACCESSED;
+        self.node
+            .set_entry(idx, SvsmPaging::make_private_address(paddr), flags)
+    }
+
+    /// Makes the memory region pages read-only.
+    /// This method is meant for global pages only.
+    ///
+    /// # Safety
+    ///
+    /// The caller should verify that `region` can be made read-only, i.e. that
+    /// no write can happen or that a #PF raised by any tentative write is
+    /// expected.
+    /// The caller must also ensure that the region start and size are 4k
+    /// aligned.
+    pub unsafe fn make_region_ro_4k(
+        &mut self,
+        region: MemoryRegion<VirtAddr>,
+    ) -> Result<(), SvsmError> {
+        for page in region.iter_pages(PageSize::Regular) {
+            let mapping = self.node.walk(page);
+            let entry = mapping.read();
+            match mapping.level() {
+                PageLevel::Level0 => {
+                    if !entry.present() || !entry.flags().global() {
+                        return Err(SvsmError::Mem);
+                    }
+
+                    let mut new_entry = PTEntry::empty();
+                    new_entry.set(entry.paddr_field(), PTEntryFlags::data_ro());
+                    mapping
+                        .update(new_entry)
+                        .ignore("caller flushes the TLB explicitly");
+                }
+                PageLevel::Level1 | PageLevel::Level2 => {
+                    // Ensure we never fell on a huge page while iterating over the region pages.
+                    if entry.huge() {
+                        return Err(SvsmError::Mem);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Deref for ActivePageTable {
+    type Target = SvsmActivePageTable;
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+impl DerefMut for ActivePageTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.node
+    }
+}
 
 impl Deref for PageTable {
     type Target = SvsmPageTable;
@@ -348,25 +597,6 @@ impl DerefMut for PageTable {
 }
 
 impl PageTable {
-    /// Load the current page table into the CR3 register.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure to take other actions to make sure a memory safe
-    /// execution state is warranted (e.g. changing the stack and register state)
-    pub unsafe fn load(&self) {
-        // SAFETY: demanded to the caller
-        unsafe {
-            write_cr3(self.cr3_value());
-        }
-    }
-
-    /// Get the CR3 register value for the current page table.
-    pub fn cr3_value(&self) -> PhysAddr {
-        let pgtable = VirtAddr::from(self as *const Self);
-        virt_to_phys(pgtable)
-    }
-
     /// Computes the index within a page table at the given level for a
     /// virtual address `vaddr`.
     ///

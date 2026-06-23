@@ -158,8 +158,10 @@ impl GhcbPage {
         }
 
         // Map page unencrypted
-        this_cpu().get_pgtable().set_shared_4k(vaddr)?;
-        flush_tlb_global_sync_page(vaddr, PageSize::Regular);
+        this_cpu()
+            .get_pgtable()
+            .set_shared_4k(vaddr)?
+            .flush_tlb_global_sync_page(vaddr, PageSize::Regular);
 
         // SAFETY: all zeros is a valid representation for the GHCB.
         Ok(Self(page))
@@ -175,7 +177,8 @@ impl Drop for GhcbPage {
         this_cpu()
             .get_pgtable()
             .set_encrypted_4k(vaddr)
-            .expect("Could not re-encrypt page");
+            .expect("Could not re-encrypt page")
+            .flush_tlb_global_sync_page(vaddr, PageSize::Regular);
 
         // Unregister GHCB PA
         // SAFETY: mapping the GHCB at physical address 0 is safe.
