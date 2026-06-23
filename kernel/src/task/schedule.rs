@@ -559,7 +559,9 @@ fn select_new_task(reschedule: bool, irq_guard: Option<IrqGuard>) {
         if next.update_cpu(cpu_index) != cpu_index {
             // Task has changed CPU, update per-cpu mappings
             let mut pt = next.page_table.lock();
-            this_cpu().populate_page_table(&mut pt);
+            // This should be an inactive page table, but it is fine to use it as such.
+            // treating a page table as active is always safer than treating it as inactive.
+            this_cpu().populate_active_page_table(&mut pt);
         }
 
         // SAFETY: ths stack pointer is known to be correct.

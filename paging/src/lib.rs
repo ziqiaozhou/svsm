@@ -4,6 +4,7 @@
 
 #![no_std]
 
+pub mod active_pagetable;
 pub mod address;
 pub mod pagetable;
 pub mod sizes;

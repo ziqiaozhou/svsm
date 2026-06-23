@@ -30,7 +30,7 @@ use crate::locking::{
     WriteLockGuard, WriteLockGuardIrqSafe,
 };
 use crate::mm::page_visibility::SharedBox;
-use crate::mm::pagetable::{PTEntryFlags, PageTable};
+use crate::mm::pagetable::{ActivePageTable, PTEntryFlags, PageTable};
 use crate::mm::virtualrange::VirtualRange;
 use crate::mm::vm::{Mapping, VMKernelStack, VMPhysMem, VMR, VMRMapping, VMReserved};
 use crate::mm::{
@@ -387,7 +387,7 @@ where
     /// PerCpu IRQ state tracking
     irq_state: IrqState,
 
-    pgtbl: RWLock<Option<&'static mut PageTable>>,
+    pgtbl: RWLock<Option<ActivePageTable>>,
     tss: X86Tss,
     isst: RWLock<Isst>,
     svsm_vmsa: ImmutAfterInitCell<VmsaPage>,
@@ -639,12 +639,12 @@ impl PerCpu {
         unsafe {
             self.vm_range.initialize()?;
         }
-        self.set_pgtable(PageBox::leak(pgtable));
+        self.set_pgtable(ActivePageTable::new(pgtable));
 
         Ok(())
     }
 
-    pub fn set_pgtable(&self, pgtable: &'static mut PageTable) {
+    pub fn set_pgtable(&self, pgtable: ActivePageTable) {
         *self.pgtbl.write_noblock() = Some(pgtable);
     }
 
@@ -706,10 +706,8 @@ impl PerCpu {
         Ok(())
     }
 
-    pub fn get_pgtable(&self) -> WriteLockGuard<'_, PageTable> {
-        WriteLockGuard::map(self.pgtbl.write_noblock(), |pgtbl| {
-            &mut **pgtbl.as_mut().unwrap()
-        })
+    pub fn get_pgtable(&self) -> WriteLockGuard<'_, ActivePageTable> {
+        WriteLockGuard::map(self.pgtbl.write_noblock(), |pgtbl| pgtbl.as_mut().unwrap())
     }
 
     /// Registers an already set up GHCB page for this CPU.
@@ -775,7 +773,7 @@ impl PerCpu {
 
     fn finish_page_table(&self) {
         let mut pgtable = self.get_pgtable();
-        self.vm_range.populate(&mut pgtable);
+        self.vm_range.populate_active(&mut pgtable);
     }
 
     pub fn dump_vm_ranges(&self) {
@@ -1150,7 +1148,16 @@ impl PerCpu {
     ///
     /// * `pt` - The page table to populate the the PerCpu range into
     pub fn populate_page_table(&self, pt: &mut PageTable) {
-        self.vm_range.populate(pt);
+        self.vm_range.populate_inactive(pt);
+    }
+
+    /// Add the PerCpu virtual range into the provided pagetable
+    ///
+    /// # Arguments
+    ///
+    /// * `pt` - The page table to populate the the PerCpu range into
+    pub fn populate_active_page_table(&self, pt: &mut ActivePageTable) {
+        self.vm_range.populate_active(pt);
     }
 
     pub fn handle_pf(&self, vaddr: VirtAddr, write: bool) -> Result<(), SvsmError> {
