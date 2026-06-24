@@ -14,8 +14,6 @@
 //! ARM64 with 4 KiB granule. Other granule sizes (16 KiB, 64 KiB on
 //! ARM64) are not supported.
 
-use super::active_pagetable::ActivePageTableNode;
-use crate::active_pagetable::PageTableRoot;
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
 pub use crate::traits::{

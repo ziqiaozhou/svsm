@@ -9,7 +9,6 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 
 use crate::address::VirtAddr;
-use crate::cpu::flush_tlb_global_sync_page;
 use crate::cpu::mem::{unsafe_copy_bytes, write_bytes};
 use crate::cpu::percpu::this_cpu;
 use crate::error::SvsmError;

@@ -9,11 +9,13 @@ use crate::traits::{
 
 #[cfg(feature = "ignore_ad")]
 unsafe fn ptr_read<T: Copy>(ptr: *const T) -> T {
+    // SAFETY: the caller guarantees `ptr` is a valid, aligned pointer.
     unsafe { *ptr }
 }
 
 #[cfg(not(feature = "ignore_ad"))]
 unsafe fn ptr_volatile_read<T>(ptr: *const T) -> T {
+    // SAFETY: the caller guarantees `ptr` is a valid, aligned pointer.
     unsafe { ptr.read_volatile() }
 }
 
@@ -34,6 +36,7 @@ unsafe fn read_entry<A: ArchPagingMeta>(entry: *const PTEntry<A>) -> PTEntry<A> 
         ptr_read(entry)
     }
     #[cfg(not(feature = "ignore_ad"))]
+    // SAFETY: as above; the caller guarantees `entry` is valid.
     unsafe {
         ptr_volatile_read(entry)
     }
@@ -153,17 +156,18 @@ pub struct ActivePageTableNode<
     P: PagingHandler,
     L: PagingLevel,
 > {
-    root: R,
+    // store the inactive table here to prevent it from being used as inactive.
+    root: R, 
     _level: PhantomData<(A, P, L)>,
 }
 
 impl<R: PageTableRoot<A, P>, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel>
     ActivePageTableNode<R, A, P, L>
 {
-    /// Wrap the installed page table rooted at `root`.
+    /// Wrap the to-be-installed page table.
     ///
     /// # Safety
-    /// `root` must point to a live page-table page that is the root of an
+    /// `root` must point to a page-table page that is the root of an
     /// `L::TOP_LEVEL` hierarchy and that remains valid for the lifetime of
     /// the returned node. The caller must also coordinate updates if the
     /// table (or any sub-tree) is shared with other page tables.
@@ -172,6 +176,17 @@ impl<R: PageTableRoot<A, P>, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: Pa
             root,
             _level: PhantomData,
         }
+    }
+
+    /// Borrow the wrapped table as an inactive table.
+    ///
+    /// # Safety
+    /// The caller must guarantee the table (and any of its sub-trees) is not
+    /// installed in any active page table, i.e. not reachable by the MMU on
+    /// any CPU, for the duration of the borrow. Inactive access forms `&mut`
+    /// references into the table and would be unsound on a live table.
+    pub unsafe fn as_inactive(&mut self) -> &mut R {
+        &mut self.root
     }
 
     /// Walks an active page table at level 0 to find a mapping.
@@ -253,6 +268,8 @@ impl<R: PageTableRoot<A, P>, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: Pa
         entry: &'a mut PTEntry<A>,
     ) -> (Mapping<'a, A>, ActiveMapping<A>) {
         let m = self.walk_addr_raw(vaddr);
+        // SAFETY: `m.entry` points at a live entry produced by the walk; a
+        // volatile read copies it without forming a reference into the table.
         *entry = unsafe { read_entry(m.entry) };
         (
             Mapping {
@@ -264,6 +281,11 @@ impl<R: PageTableRoot<A, P>, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: Pa
     }
 
     pub fn cr3_value(&self) -> PhysAddr {
+        self.root.root_pa()
+    }
+
+    /// Physical address of the root page-table page of this (sub-)tree.
+    pub fn root_pa(&self) -> PhysAddr {
         self.root.root_pa()
     }
 

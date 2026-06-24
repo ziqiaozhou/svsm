@@ -377,6 +377,16 @@ unsafe impl PageTableRoot<SvsmPaging, SvsmPaging> for PageBox<PageTable> {
     }
 }
 
+// SAFETY: `root_pa` returns the physical address of the sub-tree's root page,
+// which is page-aligned and remains valid while the box is alive.
+unsafe impl PageTableRoot<SvsmPaging, SvsmPaging> for PageBox<RawPageTablePart> {
+    fn root_pa(&self) -> PhysAddr {
+        virt_to_phys(self.vaddr())
+    }
+}
+
+type ActivePageTablePart = ActivePageTableNode<PageBox<RawPageTablePart>, SvsmPaging, SvsmPaging, PdptLevel>;
+
 type SvsmActivePageTable =
     ActivePageTableNode<PageBox<PageTable>, SvsmPaging, SvsmPaging, Pml4Level>;
 /// An *active* (installed, or about-to-be-installed) page table.
@@ -884,15 +894,19 @@ impl PageTable {
 #[derive(Debug)]
 pub struct PageTablePart {
     /// The root of the page-table sub-tree
-    raw: Option<PageBox<RawPageTablePart>>,
+    raw: Option<ActivePageTablePart>,
     /// The top-level index this PageTablePart is populated at
     idx: usize,
 }
 
 impl Drop for PageTablePart {
     fn drop(&mut self) {
-        if let Some(raw) = self.raw.as_deref() {
-            raw.free()
+        if let Some(raw) = self.raw.as_mut() {
+            // SAFETY: the sub-tree is being dropped, so it must already have
+            // been removed from any active page table and is no longer
+            // reachable by the MMU; inactive reference access is therefore
+            // sound.
+            unsafe { raw.as_inactive().free() }
         }
     }
 }
@@ -918,18 +932,22 @@ impl PageTablePart {
         self.get_or_init_mut();
     }
 
-    fn get_or_init_mut(&mut self) -> &mut RawPageTablePart {
+    fn get_or_init_mut(&mut self) -> &mut ActivePageTablePart {
         self.raw.get_or_insert_with(|| {
-            PageBox::try_new_zeroed().expect("Failed to allocate page table page")
+            let page = PageBox::try_new_zeroed().expect("Failed to allocate page table page");
+            // SAFETY: a freshly allocated sub-tree that will be linked into an
+            // active page table; treat it as active from creation so all
+            // entry accesses use volatile reads/writes.
+            unsafe { ActivePageTableNode::new(page) }
         })
     }
 
-    fn get_mut(&mut self) -> Option<&mut RawPageTablePart> {
-        self.raw.as_deref_mut()
+    fn get_mut(&mut self) -> Option<&mut ActivePageTablePart> {
+        self.raw.as_mut()
     }
 
-    fn get(&self) -> Option<&RawPageTablePart> {
-        self.raw.as_deref()
+    fn get(&self) -> Option<&ActivePageTablePart> {
+        self.raw.as_ref()
     }
 
     /// Request PageTable index to populate this instance to
@@ -948,8 +966,7 @@ impl PageTablePart {
     ///
     /// Physical base address of the page-table sub-tree
     pub fn address(&self) -> Option<PhysAddr> {
-        self.get()
-            .map(|p| virt_to_phys(VirtAddr::from(p as *const RawPageTablePart)))
+        self.get().map(|p| p.root_pa())
     }
 
     /// Map a 4KiB page in the page table sub-tree
@@ -999,7 +1016,10 @@ impl PageTablePart {
     /// This method panics when `vaddr` is not aligned to 4KiB.
     pub fn unmap_4k(&mut self, vaddr: VirtAddr) -> Option<PTEntry> {
         assert!(PageTable::index::<3>(vaddr) == self.idx);
-        self.get_mut()?.unmap_4k(vaddr)
+        self.get_mut()?.unmap_4k(vaddr).map(|(entry, flush)| {
+            flush.ignore("caller flushes the TLB explicitly");
+            entry
+        })
     }
 
     /// Map a 2MiB page in the page table sub-tree
@@ -1049,7 +1069,10 @@ impl PageTablePart {
     /// This method panics when `vaddr` is not aligned to 2MiB.
     pub fn unmap_2m(&mut self, vaddr: VirtAddr) -> Option<PTEntry> {
         assert!(PageTable::index::<3>(vaddr) == self.idx);
-        self.get_mut()?.unmap_2m(vaddr)
+        self.get_mut()?.unmap_2m(vaddr).map(|(entry, flush)| {
+            flush.ignore("caller flushes the TLB explicitly");
+            entry
+        })
     }
 }
 
