@@ -5,10 +5,7 @@
 // Author: Thomas Leroy <thomas.leroy.mp@gmail.com>
 
 use crate::{
-    address::VirtAddr,
-    cpu::{flush_tlb_global_sync_range, percpu::this_cpu},
-    error::SvsmError,
-    types::PageSize,
+    address::VirtAddr, cpu::percpu::this_cpu, error::SvsmError, types::PageSize,
     utils::MemoryRegion,
 };
 #[macro_export]
@@ -31,10 +28,11 @@ unsafe extern "C" {
 pub unsafe fn make_ro(region: MemoryRegion<VirtAddr>) -> Result<(), SvsmError> {
     // SAFETY: delegated to the caller.
     unsafe {
-        this_cpu().get_pgtable().make_region_ro_4k(region)?;
+        this_cpu()
+            .get_pgtable()
+            .make_region_ro_4k(region)?
+            .flush_tlb_global_sync_range(region.start(), region.len(), PageSize::Regular);
     }
-
-    flush_tlb_global_sync_range(region, PageSize::Regular);
 
     Ok(())
 }

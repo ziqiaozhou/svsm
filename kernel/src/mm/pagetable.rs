@@ -28,6 +28,7 @@ use cpuarch::x86::EFERFlags;
 use paging::pagetable::{
     ArchPagingMeta, GenericPageTable, PageLevel, PagingError, PagingHandler, SelfMap,
 };
+use paging::tlb::MayNeedFlush;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 
@@ -140,6 +141,41 @@ impl ArchPagingMeta for SvsmPaging {
     }
 }
 
+// SAFETY trait: stateless TLB hooks dispatching to the kernel's `cpu::tlb`
+// free functions; used to discharge `MayNeedFlush` obligations.
+impl paging::tlb::TlbOps for SvsmPaging {
+    fn flush_tlb_global_sync() {
+        crate::cpu::flush_tlb_global_sync();
+    }
+
+    fn flush_tlb_global_sync_page(vaddr: VirtAddr, page_size: PageSize) {
+        crate::cpu::flush_tlb_global_sync_page(vaddr, page_size);
+    }
+
+    fn flush_tlb_global_sync_range(start: VirtAddr, len: usize, page_size: PageSize) {
+        crate::cpu::flush_tlb_global_sync_range(MemoryRegion::new(start, len), page_size);
+    }
+
+    fn flush_tlb_global_percpu() {
+        crate::cpu::flush_tlb_global_percpu();
+    }
+
+    fn flush_tlb_percpu() {
+        crate::cpu::flush_tlb_percpu();
+    }
+
+    fn flush_address_percpu(vaddr: VirtAddr) {
+        crate::cpu::flush_address_percpu(vaddr);
+    }
+
+    fn flush_range_percpu(start: VirtAddr, len: usize, page_size: PageSize) {
+        let region = MemoryRegion::new(start, len);
+        for page in region.iter_pages(page_size) {
+            crate::cpu::flush_address_percpu(page);
+        }
+    }
+}
+
 // SAFETY: paddr_to_vaddr correctly maps physical addresses via phys_to_virt,
 // and allocate_physical_page returns unique zeroed frames via PageBox.
 unsafe impl PagingHandler for SvsmPaging {
@@ -217,6 +253,8 @@ pub type Mapping<'a> = paging::pagetable::Mapping<'a, SvsmPaging>;
 
 /// A physical address within a page frame
 pub type PageFrame = paging::pagetable::PageFrame<SvsmPaging>;
+
+pub type SvsmMayNeedFlush = MayNeedFlush<SvsmPaging>;
 
 trait PTEntryExt {
     /// Check if the page table entry has reserved bits set.
@@ -610,10 +648,14 @@ impl PageTable {
     /// expected.
     /// The caller must also ensure that the region start and size are 4k
     /// aligned.
+    ///
+    /// # Returns
+    /// The [`MayNeedFlush`] TLB-flush obligation for the now-stale
+    /// translations on success, or a [`SvsmError`] on failure.
     pub unsafe fn make_region_ro_4k(
         &mut self,
         region: MemoryRegion<VirtAddr>,
-    ) -> Result<(), SvsmError> {
+    ) -> Result<SvsmMayNeedFlush, SvsmError> {
         for page in region.iter_pages(PageSize::Regular) {
             match self.walk_addr(page) {
                 Mapping {
@@ -643,7 +685,7 @@ impl PageTable {
             }
         }
 
-        Ok(())
+        Ok(MayNeedFlush::new(PageLevel::Level0))
     }
 }
 
@@ -760,12 +802,14 @@ impl PageTablePart {
     ///
     /// # Returns
     ///
-    /// Returns a copy of the PTEntry that mapped the virtual address, if any.
+    /// A copy of the [`PTEntry`] that mapped the virtual address together with
+    /// the [`MayNeedFlush`] TLB-flush obligation for the now-stale translation,
+    /// or [`None`] if no leaf was mapped.
     ///
     /// # Panics
     ///
     /// This method panics when `vaddr` is not aligned to 4KiB.
-    pub fn unmap_4k(&mut self, vaddr: VirtAddr) -> Option<PTEntry> {
+    pub fn unmap_4k(&mut self, vaddr: VirtAddr) -> Option<(PTEntry, SvsmMayNeedFlush)> {
         assert!(PageTable::index::<3>(vaddr) == self.idx);
         self.get_mut()?.unmap_4k(vaddr)
     }
@@ -810,12 +854,14 @@ impl PageTablePart {
     ///
     /// # Returns
     ///
-    /// Returns a copy of the PTEntry that mapped the virtual address, if any.
+    /// A copy of the [`PTEntry`] that mapped the virtual address together with
+    /// the [`MayNeedFlush`] TLB-flush obligation for the now-stale translation,
+    /// or [`None`] if no huge leaf was mapped.
     ///
     /// # Panics
     ///
     /// This method panics when `vaddr` is not aligned to 2MiB.
-    pub fn unmap_2m(&mut self, vaddr: VirtAddr) -> Option<PTEntry> {
+    pub fn unmap_2m(&mut self, vaddr: VirtAddr) -> Option<(PTEntry, SvsmMayNeedFlush)> {
         assert!(PageTable::index::<3>(vaddr) == self.idx);
         self.get_mut()?.unmap_2m(vaddr)
     }
