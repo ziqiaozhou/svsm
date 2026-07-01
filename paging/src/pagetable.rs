@@ -16,6 +16,7 @@
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
+pub use crate::tlb::{MayNeedFlush, TlbOps};
 pub use crate::traits::{
     ArchPagingMeta, GenericPageTableFlags, PageLevel, PagingError, PagingHandler, PagingLevel,
     PagingLevel2, PagingLevel3, SelfMap,
@@ -512,7 +513,7 @@ impl<A: ArchPagingMeta, P: PagingHandler + SelfMap> GenericPageTable<A, P, Pagin
     }
 }
 
-impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P, L> {
+impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P, L> {
     /// Allocate from level 3 (PML4E) down to the target level.
     fn alloc_pte_lvl3(
         entry: &mut PTEntry<A>,
@@ -626,6 +627,12 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     ///
     /// # Returns
     /// A result indicating success or an error [`PagingError`] in failure.
+    ///
+    /// Does not flush the TLB itself: splitting only republishes the same
+    /// physical range through a new subtable, so the resulting `PTEntry`
+    /// still translates the same addresses. The caller who ultimately edits
+    /// the split-out leaf is responsible for deciding whether that edit
+    /// needs a flush, via the [`MayNeedFlush`] token it returns.
     fn do_split_4k(entry: &mut PTEntry<A>) -> Result<(), PagingError> {
         let (page, paddr) = PTPage::<A, P>::alloc()?;
         let mut flags = entry.flags();
@@ -644,8 +651,6 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         }
 
         entry.set(A::make_private_address(paddr), flags);
-
-        A::flush_tlb_global();
 
         Ok(())
     }
@@ -687,10 +692,11 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// - `vaddr`: The virtual address of the page.
     ///
     /// # Returns
-    /// A result indicating success or an error [`PagingError`] if the
-    /// operation fails.
-    pub fn set_shared_4k(&mut self, vaddr: VirtAddr) -> Result<(), PagingError> {
+    /// The [`MayNeedFlush`] TLB-flush obligation for the now-stale
+    /// translation on success, or a [`PagingError`] on failure.
+    pub fn set_shared_4k(&mut self, vaddr: VirtAddr) -> Result<MayNeedFlush<A>, PagingError> {
         let mapping = self.walk_addr(vaddr);
+        let level = mapping.level;
         Self::split_4k(mapping)?;
 
         if let Mapping {
@@ -699,7 +705,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         } = self.walk_addr(vaddr)
         {
             Self::make_pte_shared(entry);
-            Ok(())
+            Ok(MayNeedFlush(level, PhantomData))
         } else {
             Err(PagingError::NotMapped)
         }
@@ -711,9 +717,11 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// - `vaddr`: The virtual address of the page.
     ///
     /// # Returns
-    /// A result indicating success or an error [`PagingError`].
-    pub fn set_encrypted_4k(&mut self, vaddr: VirtAddr) -> Result<(), PagingError> {
+    /// The [`MayNeedFlush`] TLB-flush obligation for the now-stale
+    /// translation on success, or a [`PagingError`] on failure.
+    pub fn set_encrypted_4k(&mut self, vaddr: VirtAddr) -> Result<MayNeedFlush<A>, PagingError> {
         let mapping = self.walk_addr(vaddr);
+        let level = mapping.level;
         Self::split_4k(mapping)?;
 
         if let Mapping {
@@ -722,7 +730,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         } = self.walk_addr(vaddr)
         {
             Self::make_pte_private(entry);
-            Ok(())
+            Ok(MayNeedFlush(level, PhantomData))
         } else {
             Err(PagingError::NotMapped)
         }
@@ -798,19 +806,25 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// # Parameters
     /// - `vaddr`: The virtual address of the mapping to unmap.
     ///
+    /// # Returns
+    /// A copy of the [`PTEntry`] that mapped the virtual address together
+    /// with the [`MayNeedFlush`] TLB-flush obligation for the now-stale
+    /// translation, or [`None`] if no huge leaf was mapped.
+    ///
     /// # Panics
     /// Panics if `vaddr` is not aligned to a 2MB boundary.
-    pub fn unmap_2m(&mut self, vaddr: VirtAddr) -> Option<PTEntry<A>> {
+    pub fn unmap_2m(&mut self, vaddr: VirtAddr) -> Option<(PTEntry<A>, MayNeedFlush<A>)> {
         assert!(vaddr.is_aligned(PAGE_SIZE_2M));
 
         let mapping = self.walk_addr(vaddr);
 
+        let level = mapping.level;
         match mapping.level {
             PageLevel::Level0 => unreachable!(),
             PageLevel::Level1 => {
                 let entry = *mapping.entry;
                 mapping.entry.clear();
-                Some(entry)
+                Some((entry, MayNeedFlush(level, PhantomData)))
             }
             _ => {
                 assert!(!mapping.entry.present());
@@ -881,14 +895,20 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     ///
     /// # Parameters
     /// - `vaddr`: The virtual address of the mapping to unmap.
-    pub fn unmap_4k(&mut self, vaddr: VirtAddr) -> Option<PTEntry<A>> {
+    ///
+    /// # Returns
+    /// A copy of the [`PTEntry`] that mapped the virtual address together
+    /// with the [`MayNeedFlush`] TLB-flush obligation for the now-stale
+    /// translation, or [`None`] if no leaf was mapped.
+    pub fn unmap_4k(&mut self, vaddr: VirtAddr) -> Option<(PTEntry<A>, MayNeedFlush<A>)> {
         let mapping = self.walk_addr(vaddr);
+        let level = mapping.level;
 
         match mapping.level {
             PageLevel::Level0 => {
                 let entry = *mapping.entry;
                 mapping.entry.clear();
-                Some(entry)
+                Some((entry, MayNeedFlush(level, PhantomData)))
             }
             _ => {
                 assert!(!mapping.entry.present());
