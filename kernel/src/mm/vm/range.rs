@@ -117,7 +117,7 @@ impl VMR {
         for idx in 0..count {
             let mut part = PageTablePart::new(start + (idx * VMR_GRANULE));
             if !lazy {
-                part.alloc();
+                part.alloc()?;
             }
             vec.push(part);
         }
@@ -129,12 +129,12 @@ impl VMR {
     ///
     /// # Arguments
     ///
-    /// * `pgtbl` - A [`PageTable`] pointing to the target page-table
+    /// * `pgtbl` - A page table implementing the [`Populate`] trait
     pub fn populate(&self, pgtbl: &mut PageTable) {
         let parts = self.pgtbl_parts.lock_read();
 
         for part in parts.iter() {
-            pgtbl.populate_pgtbl_part(part);
+            part.populate_by(&mut *pgtbl);
         }
     }
 
@@ -146,7 +146,7 @@ impl VMR {
 
         let idx = vaddr.to_pgtbl_idx::<3>() - vregion.start().to_pgtbl_idx::<3>();
         let parts = self.pgtbl_parts.lock_read();
-        if !pgtbl.populate_pgtbl_part(&parts[idx]) {
+        if !parts[idx].populate_by(pgtbl) {
             return Err(SvsmError::Mem);
         }
         Ok(())

@@ -360,7 +360,8 @@ unsafe fn svsm_start(
     }
 
     // SAFETY: the current page table was was placed into the kernel heap as
-    // part of the boot image and therefore it can be built into a PageBox.
+    // part of the boot image and therefore it can be built into a PageBox. It
+    // is the table currently loaded into CR3, hence an installed [`PageTable`].
     let init_pgtable: PageBox<PageTable> = unsafe {
         let page_table_ptr = (launch_info.kernel_page_table_vaddr as usize) as *mut PageTable;
         PageBox::from_raw(NonNull::new(page_table_ptr).unwrap())

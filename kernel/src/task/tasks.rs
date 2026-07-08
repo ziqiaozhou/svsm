@@ -502,7 +502,7 @@ impl Task {
         let kernel_stack_mapping = TaskKernelMapping::new(task_mm.clone(), stack)?;
         let stack_start = kernel_stack_mapping.virt_addr();
 
-        task_mm.kernel_range().populate(&mut pgtable);
+        task_mm.kernel_range().populate(&mut *pgtable);
 
         // Remap at the per-task offset
         let bounds = MemoryRegion::new(stack_start + raw_bounds.start().into(), raw_bounds.len());
