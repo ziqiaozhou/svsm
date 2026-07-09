@@ -116,7 +116,6 @@ impl<A: ArchPagingMeta> PTEntry<A> {
         self.set(A::make_private_address(addr), flags);
     }
 
-
     /// Get the paddr field from the entry.
     ///
     /// Returns bits `[51:12]` of the entry — the address *including* any
@@ -167,7 +166,7 @@ impl<A: ArchPagingMeta> PTEntry<A> {
 }
 
 /// A pagetable page with multiple entries.
-#[repr(C)]
+#[repr(C, align(4096))]
 #[derive(Debug, FromZeros)]
 pub struct PTPage<A: ArchPagingMeta, P: PagingHandler> {
     entries: [PTEntry<A>; ENTRY_COUNT],
@@ -492,10 +491,7 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
     /// # Returns
     /// A result containing the updated mapping for the virtual address, or an error
     /// [`PagingError`] in failure.
-    fn split_4k(
-        mapping: Mapping<'_, A>,
-        vaddr: VirtAddr,
-    ) -> Result<Mapping<'_, A>, PagingError> {
+    fn split_4k(mapping: Mapping<'_, A>, vaddr: VirtAddr) -> Result<Mapping<'_, A>, PagingError> {
         match mapping.level {
             PageLevel::Level0 => Ok(mapping),
             PageLevel::Level1 => {

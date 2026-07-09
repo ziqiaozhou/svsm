@@ -29,7 +29,6 @@ use paging::active_pagetable::ActivePageTable;
 use paging::pagetable::{ArchPagingMeta, PageLevel, PagingError, PagingHandler, SelfMap};
 use paging::tlb::MayNeedFlush;
 use zerocopy::FromBytes;
-use zerocopy::FromZeros;
 
 /// Re-export types from the paging crate.
 pub use paging::x86_64::{PTEntryFlags, PdptLevel, Pml4Level};
@@ -360,7 +359,7 @@ pub type InstalledPageTable = ActivePageTable<SvsmPaging, SvsmPaging, Pml4Level>
 /// Represents a sub-tree of a page-table which can be mapped at a top-level index
 pub type RawPageTablePart = ActivePageTable<SvsmPaging, SvsmPaging, PdptLevel>;
 
-#[derive(Debug, FromZeros)]
+#[derive(Debug)]
 #[repr(transparent)]
 pub struct PageTable(InstalledPageTable);
 
@@ -379,6 +378,19 @@ impl DerefMut for PageTable {
 }
 
 impl PageTable {
+    /// Wrap an already-installed root page (e.g. the boot page table handed
+    /// over by stage2) as an owning [`PageTable`] handle.
+    ///
+    /// # Safety
+    /// Same requirements as [`ActivePageTable::from_root_ptr`]: `root` must be
+    /// a valid, page-aligned root page freeable via the [`PagingHandler`], and
+    /// ownership is transferred to the returned handle. Leak it with
+    /// [`core::mem::forget`] if the page must outlive the handle.
+    pub unsafe fn from_root_ptr(root: *mut PTPage) -> Self {
+        // SAFETY: guaranteed by the caller.
+        Self(unsafe { InstalledPageTable::from_root_ptr(root) })
+    }
+
     /// Load the current page table into the CR3 register.
     ///
     /// # Safety
@@ -427,8 +439,8 @@ impl PageTable {
     ///
     /// # Errors
     /// Returns [`SvsmError`] if the page cannot be allocated.
-    fn allocate_new() -> Result<PageBox<PageTable>, SvsmError> {
-        let mut pgtable: PageBox<PageTable> = PageBox::try_new_zeroed()?;
+    fn allocate_new() -> Result<PageTable, SvsmError> {
+        let mut pgtable = PageTable(InstalledPageTable::alloc()?);
         // SAFETY: The page table is newly allocated and zeroed, so it is safe to initialize the self-map.
         unsafe {
             pgtable.as_inactive().init_self_map();
@@ -441,7 +453,7 @@ impl PageTable {
     ///
     /// # Errors
     /// Returns [`SvsmError`] if the page cannot be allocated.
-    pub fn clone_shared(&self) -> Result<PageBox<PageTable>, SvsmError> {
+    pub fn clone_shared(&self) -> Result<PageTable, SvsmError> {
         let mut pgtable = Self::allocate_new()?;
         self.next_table(PGTABLE_LVL3_IDX_SHARED)
             .map(|next| pgtable.populate(PGTABLE_LVL3_IDX_SHARED, &next));
@@ -640,7 +652,7 @@ impl PageTable {
 #[derive(Debug)]
 pub struct PageTablePart {
     /// The root of the page-table sub-tree
-    raw: Option<PageBox<RawPageTablePart>>,
+    raw: Option<RawPageTablePart>,
     /// The top-level index this PageTablePart is populated at
     idx: usize,
 }
@@ -680,17 +692,17 @@ impl PageTablePart {
 
     fn get_or_init_mut(&mut self) -> Result<&mut RawPageTablePart, SvsmError> {
         if self.raw.is_none() {
-            self.raw = Some(PageBox::try_new_zeroed()?);
+            self.raw = Some(RawPageTablePart::alloc()?);
         }
-        Ok(self.raw.as_deref_mut().unwrap())
+        Ok(self.raw.as_mut().unwrap())
     }
 
     fn get_mut(&mut self) -> Option<&mut RawPageTablePart> {
-        self.raw.as_deref_mut()
+        self.raw.as_mut()
     }
 
     fn get(&self) -> Option<&RawPageTablePart> {
-        self.raw.as_deref()
+        self.raw.as_ref()
     }
 
     /// Request PageTable index to populate this instance to

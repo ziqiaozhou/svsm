@@ -1,20 +1,17 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
-use zerocopy::FromZeros;
-
 use crate::address::{Address, PhysAddr, VirtAddr};
-use crate::pagetable::{
-    Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame, virt_from_lvl_idx,
-};
+use crate::pagetable::{Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame, virt_from_lvl_idx};
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE_2M};
 use crate::tlb::{MayNeedFlush, TlbOps};
 use crate::traits::{
     ArchPagingMeta, GenericPageTableFlags, NextLevel, PageLevel, PagingError, PagingHandler,
     PagingLevel, PagingLevel3, SelfMap,
 };
-
-
 
 /// The resolved result of a page-table walk on an *active* (installed)
 /// page table: the level at which the walk terminated, together with a
@@ -91,7 +88,7 @@ impl<A: ArchPagingMeta + TlbOps> InstalledMapping<'_, A> {
 }
 
 /// An *installed* (active) page table.
-/// 
+///
 /// The root is a concrete page-table page whose level is described
 /// by `L`. This can represent either a complete top-level page table, such as
 /// a PML4-rooted table, or a lower-level subtree, such as a PDPT-rooted table
@@ -102,45 +99,104 @@ impl<A: ArchPagingMeta + TlbOps> InstalledMapping<'_, A> {
 /// all users of that subtree must coordinate updates to avoid concurrent
 /// modifications to the same page-table entries.
 ///
-/// The root page is stored in an [`UnsafeCell`](core::cell::UnsafeCell) so the
-/// compiler does not treat its contents as immutable / `noalias` when holding a
-/// shared reference. This is required because the MMU may concurrently update
-/// entries (e.g. the accessed/dirty bits) while the table is live.
 ///
-/// The `UnsafeCell` alone is not enough: all entry accesses must go through the
-/// raw pointer from [`UnsafeCell::get`](core::cell::UnsafeCell::get) using
-/// **volatile** (or atomic) reads and writes. Never form a `&` or `&mut`
-/// reference into an installed table — that would assert the absence of
-/// concurrent mutation and is undefined behavior, and it would also let the
-/// compiler elide or reorder the accesses.
+/// The root is stored as a raw pointer so the compiler does not treat
+/// its contents as immutable / `noalias` when holding a shared reference. This
+/// is required because the MMU may concurrently update entries (e.g. the
+/// accessed/dirty bits) while the table is live. All entry accesses must go
+/// through this raw pointer using **volatile** (or atomic) reads and writes.
+/// Never form a `&` or `&mut` reference into an installed table — that would
+/// assert the absence of concurrent mutation and is undefined behavior, and it
+/// would also let the compiler elide or reorder the accesses.
 #[repr(transparent)]
-#[derive(Debug, FromZeros)]
+#[derive(Debug)]
 pub struct ActivePageTable<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> {
-    // store the inactive table here to prevent it from being used as inactive.
-    /// The root page table.
-    root: core::cell::UnsafeCell<PTPage<A, P>>,
+    /// The root page-table page.
+    root: core::ptr::NonNull<PTPage<A, P>>,
     _level: PhantomData<(A, P, L)>,
 }
 
-// SAFETY: the node identifies an installed page table by the address of its
-// backing page and accesses entries only through volatile reads/writes, which
-// are valid from any CPU. Shared (`&`) access performs no mutation, so the node
-// is safe to share across threads; exclusive mutation is serialized through
-// `&mut` (and the locks that hold the node).
+// SAFETY: `ActivePageTable` is an owning handle to a page table
+// page, much like `Box<PTPage>`.
+// - The handle owns the page, so moving it to another thread simply transfers
+//   that ownership; the origin thread no longer holds the handle.
+// - The pointer addresses a page table through the global direct map,
+//   which is valid and identical on every CPU, so it carries no thread-affine
+//   state.
+// - `A`, `P` and `L` appear only in `PhantomData`, so no non-`Send` data is
+//   carried alongside.
+// This makes it exactly as `Send` as a `Box` over `Send` contents.
+unsafe impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> Send
+    for ActivePageTable<A, P, L>
+{
+}
+
+// SAFETY: `Sync` asks whether `&ActivePageTable` can be shared across threads,
+// i.e. what a *shared* borrow permits:
+// - Through `&self` page table entries can only be *read*, and every read is a
+//   volatile load through the raw pointer (see `read_pte`/`ImmutableInstalledMapping`).
+//   The code never forms a `&`/`&mut` reference into the page on a live table,
+//   so it never asserts `noalias`; concurrent volatile reads from several CPUs
+//   (and concurrent MMU updates to accessed/dirty bits) are therefore well
+//   defined rather than a data race.
+// - All entry *mutation* goes through `&mut self` methods, so `&`-sharing alone
+//   never mutates; exclusive mutation is serialized by the `&mut` borrow (and,
+//   in the kernel, by the lock or write-once atomic that owns the handle).
+// The one operation that forms a real `&mut` into the page, `as_inactive`, is
+// `unsafe` and requires the table to be uninstalled, which is outside the
+// `Sync`-relevant (installed, shared) regime.
+//
+// Note: `Sync` covers only the handle. If the same subtree is installed under
+// multiple top-level tables, callers must still coordinate updates to that
+// shared page, as documented on the type.
 unsafe impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> Sync
     for ActivePageTable<A, P, L>
 {
 }
 
+impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> Drop
+    for ActivePageTable<A, P, L>
+{
+    fn drop(&mut self) {
+        // Only the root page is freed here; any child tables must have been
+        // released separately (e.g. via `free_children`). Tables that must
+        // outlive their handle (installed / boot tables) are leaked with
+        // `core::mem::forget` and never reach this path.
+        let paddr = self.root_pa();
+        // SAFETY: `root` was produced by `alloc`/`from_root_ptr`, so `paddr`
+        // is a clean physical address previously returned by
+        // `allocate_physical_page` and not yet freed.
+        unsafe {
+            P::deallocate_physical_page(paddr);
+        }
+    }
+}
+
 impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTable<A, P, L> {
-    /// Wrap the to-be-installed page table.
-    /// Transition it to a may-be active page table.
+    /// Allocate a fresh, zeroed root page and wrap it as an owning handle.
+    ///
+    /// The page is obtained from [`PagingHandler::allocate_physical_page`] and
+    /// is freed when the handle is dropped.
+    pub fn alloc() -> Result<Self, PagingError> {
+        let paddr = P::allocate_physical_page()?;
+        let vaddr = P::paddr_to_vaddr(paddr);
+        // SAFETY: `vaddr` is a valid, page-aligned pointer to a page obtained from
+        Ok(unsafe { Self::from_root_ptr(vaddr.as_mut_ptr()) })
+    }
+
+    /// Take ownership of an existing root page.
+    ///
     /// # Safety
-    /// The caller must guarantee that the root is a valid, page-aligned pointer
-    /// to a root page-table page that remains valid for the lifetime of the implementor.
-    pub fn new(inactive: PTPage<A, P>) -> Self {
+    /// `root` must be a valid, page-aligned pointer to a root page-table page
+    /// that was allocated via [`PagingHandler::allocate_physical_page`] (or an
+    /// equivalent source freeable by
+    /// [`PagingHandler::deallocate_physical_page`]). Ownership is transferred
+    /// to the returned handle, which frees the page on drop; leak it with
+    /// [`core::mem::forget`] if the page must outlive the handle (e.g. a table
+    /// installed in CR3).
+    pub unsafe fn from_root_ptr(root: *mut PTPage<A, P>) -> Self {
         Self {
-            root: core::cell::UnsafeCell::new(inactive),
+            root: core::ptr::NonNull::new(root).unwrap(),
             _level: PhantomData,
         }
     }
@@ -158,7 +214,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     }
 
     fn root_page(&self) -> *const PTPage<A, P> {
-        self.root.get()
+        self.root.as_ptr()
     }
 
     pub fn root_pa(&self) -> PhysAddr {
@@ -173,14 +229,15 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     /// Inactive access forms `&mut` references into the table and would be
     /// unsound on a live table.
     pub unsafe fn as_inactive(&mut self) -> &mut PTPage<A, P> {
-        // SAFETY: `GenericPageTable` and `ActivePageTableNode` share the same
-        // backing root page layout, and the caller guarantees the table is not
-        // installed, so forming a `&mut` into it is sound.
-        unsafe { &mut *(self.root_page() as *mut PTPage<A, P>) }
+        // SAFETY: `root` points to a valid root page and the caller guarantees
+        // the table is not installed, so forming a `&mut` into it is sound.
+        unsafe { self.root.as_mut() }
     }
 
     pub unsafe fn free_children(&mut self) {
-        unsafe { self.as_inactive().free_lvl(L::TOP_LEVEL); }
+        unsafe {
+            self.as_inactive().free_lvl(L::TOP_LEVEL);
+        }
     }
 
     /// Get the next level page table view at the given index.
@@ -199,8 +256,13 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
             return None;
         }
         Some(ActivePageTableRef {
-            ptr: P::paddr_to_vaddr(entry.address()).as_mut_ptr(),
-            _level: PhantomData,
+            // SAFETY: the child page is a valid root page for the next level.
+            // The handle is borrowed (non-owning) and must not free the page,
+            // which is guaranteed by wrapping it in `ManuallyDrop`.
+            inner: ManuallyDrop::new(unsafe {
+                ActivePageTable::from_root_ptr(P::paddr_to_vaddr(entry.address()).as_mut_ptr())
+            }),
+            _life: PhantomData,
         })
     }
 
@@ -209,11 +271,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     /// terminated.
     /// This is the only entry to get an [`ActiveMapping`] from an active page table.
     pub fn walk_mut(&mut self, vaddr: VirtAddr) -> InstalledMapping<'_, A> {
-        let tbl_view = ActivePageTableRef::<A, P, L> {
-            ptr: self,
-            _level: PhantomData,
-        };
-        let m = tbl_view.walk(vaddr);
+        let m = self.walk(vaddr);
         InstalledMapping {
             level: m.level,
             entry: m.entry as *mut PTEntry<A>,
@@ -488,8 +546,9 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
         }
     }
 
-    pub fn populate(&mut self, idx: usize, child: &ActivePageTable<A, P, L::Next>) -> bool 
-    where L: NextLevel
+    pub fn populate(&mut self, idx: usize, child: &ActivePageTable<A, P, L::Next>) -> bool
+    where
+        L: NextLevel,
     {
         let desired = PTEntry::new(
             A::make_private_address(child.root_pa()),
@@ -592,10 +651,17 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler + SelfMap> ActivePageTable<A, 
     }
 }
 
+/// A borrowed, non-owning view of an active page table (typically a child
+/// subtree reached via [`ActivePageTable::next_table`]).
+///
+/// The inner handle is wrapped in [`ManuallyDrop`] so that dropping the view
+/// never frees the underlying page; ownership stays with whoever owns the
+/// parent table. The lifetime `'a` bounds the view to the borrow it was
+/// derived from.
 #[derive(Debug)]
 pub struct ActivePageTableRef<'a, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> {
-    ptr: *mut ActivePageTable<A, P, L>,
-    _level: PhantomData<(&'a (), A, P, L)>,
+    inner: ManuallyDrop<ActivePageTable<A, P, L>>,
+    _life: PhantomData<&'a ()>,
 }
 
 impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> Deref
@@ -604,9 +670,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> Deref
     type Target = ActivePageTable<A, P, L>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: `ptr` was constructed from a valid node reference or an
-        // installed root page and stays valid for the view's lifetime `'a`.
-        unsafe { self.ptr.as_ref().unwrap() }
+        &self.inner
     }
 }
 
@@ -614,8 +678,6 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> DerefMut
     for ActivePageTableRef<'_, A, P, L>
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: see `deref`; the exclusive borrow of the view grants
-        // exclusive access to the pointed-to node.
-        unsafe { self.ptr.as_mut().unwrap() }
+        &mut self.inner
     }
 }

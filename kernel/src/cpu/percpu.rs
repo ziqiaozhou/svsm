@@ -40,7 +40,7 @@ use crate::mm::{
     SVSM_PERCPU_CAA_BASE, SVSM_PERCPU_END, SVSM_PERCPU_TEMP_BASE_2M, SVSM_PERCPU_TEMP_BASE_4K,
     SVSM_PERCPU_TEMP_SIZE_2M, SVSM_PERCPU_TEMP_SIZE_4K, SVSM_PERCPU_VMSA_BASE,
     SVSM_SHADOW_STACK_ISST_DF_BASE, SVSM_SHADOW_STACKS_INIT_TASK, SVSM_STACK_IST_DF_BASE,
-    virt_to_phys,
+    phys_to_virt, virt_to_phys,
 };
 use crate::platform::{SVSM_PLATFORM, SvsmPlatform};
 use crate::requests::SvsmCaa;
@@ -664,25 +664,29 @@ impl PerCpu {
         self.shared().apic_id()
     }
 
-    pub fn init_page_table(&self, pgtable: PageBox<PageTable>) -> Result<(), SvsmError> {
+    pub fn init_page_table(&self, pgtable: PageTable) -> Result<(), SvsmError> {
         // SAFETY: The per-CPU address range is fully aligned to top-level
         // paging boundaries.
         unsafe {
             self.vm_range.initialize()?;
         }
-        self.set_pgtable(PageBox::leak(pgtable));
+        self.set_pgtable(pgtable);
 
         Ok(())
     }
 
-    pub fn set_pgtable(&self, pgtable: &'static mut PageTable) {
-        let vaddr = VirtAddr::from(ptr::from_ref(pgtable) as usize);
+    pub fn set_pgtable(&self, pgtable: PageTable) {
+        let paddr = pgtable.cr3_value();
+        let vaddr = phys_to_virt(paddr);
         self.pgtbl
             .compare_exchange(0, vaddr.into(), Ordering::Relaxed, Ordering::Relaxed)
             .unwrap();
         // Capture the physical address as well for use in task switch.
-        let paddr = virt_to_phys(vaddr);
         self.cr3.store(paddr.into(), Ordering::Relaxed);
+        // The installed table must outlive every borrow handed out by
+        // `get_pgtable`, so leak the owning handle here: its `Drop` must never
+        // free the still-live root page.
+        core::mem::forget(pgtable);
     }
 
     fn allocate_stack(&self, base: VirtAddr) -> Result<VirtAddr, SvsmError> {
@@ -750,10 +754,7 @@ impl PerCpu {
         // physical address of this processor's paging root.  It is stored as
         // an `AtomicUsize` so it can be read from contexts that cannot
         // acquire locks.
-        unsafe {
-            let mut p = NonNull::new(self.pgtbl.load(Ordering::Relaxed) as *mut PageTable).unwrap();
-            p.as_mut()
-        }
+        unsafe { &mut *(self.pgtbl.as_ptr() as *mut PageTable) }
     }
 
     /// Registers an already set up GHCB page for this CPU.
@@ -826,11 +827,7 @@ impl PerCpu {
         self.vm_range.dump_ranges();
     }
 
-    pub fn setup(
-        &self,
-        platform: &dyn SvsmPlatform,
-        pgtable: PageBox<PageTable>,
-    ) -> Result<(), SvsmError> {
+    pub fn setup(&self, platform: &dyn SvsmPlatform, pgtable: PageTable) -> Result<(), SvsmError> {
         self.init_page_table(pgtable)?;
 
         // Map PerCpu data in own page-table

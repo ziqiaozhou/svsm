@@ -49,8 +49,8 @@ use svsm::mm::alloc::{free_multiple_pages, memory_info, print_memory_info, root_
 use svsm::mm::global_memory::init_global_ranges;
 use svsm::mm::init_kernel_mapping_info;
 use svsm::mm::memory::init_memory_map;
-use svsm::mm::pagetable::PageTable;
 use svsm::mm::pagetable::paging_init;
+use svsm::mm::pagetable::{PTPage, PageTable};
 use svsm::mm::ro_after_init::make_ro_after_init;
 use svsm::mm::validate::init_valid_bitmap;
 use svsm::mm::virtualrange::virt_log_usage;
@@ -362,9 +362,9 @@ unsafe fn svsm_start(
     // SAFETY: the current page table was was placed into the kernel heap as
     // part of the boot image and therefore it can be built into a PageBox. It
     // is the table currently loaded into CR3, hence an installed [`PageTable`].
-    let init_pgtable: PageBox<PageTable> = unsafe {
-        let page_table_ptr = (launch_info.kernel_page_table_vaddr as usize) as *mut PageTable;
-        PageBox::from_raw(NonNull::new(page_table_ptr).unwrap())
+    let init_pgtable: PageTable = unsafe {
+        let page_table_ptr = (launch_info.kernel_page_table_vaddr as usize) as *mut PTPage;
+        PageTable::from_root_ptr(page_table_ptr)
     };
 
     init_global_ranges();
