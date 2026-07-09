@@ -1,8 +1,4 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Copyright (c) 2022-2023 SUSE LLC
-//
-// Author: Joerg Roedel <jroedel@suse.de>
 
 //! Generic page table types and structures for 4 KiB granule paging.
 //!
@@ -14,10 +10,8 @@
 //! ARM64 with 4 KiB granule. Other granule sizes (16 KiB, 64 KiB on
 //! ARM64) are not supported.
 
-use crate::active_pagetable::ActivePageTableView;
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
-use crate::tlb::TlbOps;
 pub use crate::traits::{
     ArchPagingMeta, GenericPageTableFlags, PageLevel, PagingError, PagingHandler, PagingLevel,
     PagingLevel2, PagingLevel3, SelfMap,
@@ -106,12 +100,22 @@ impl<A: ArchPagingMeta> PTEntry<A> {
         *self = Self::new(addr, flags);
     }
 
-    /// Inserts the private address mask if the page is present.
-    pub fn make_private_if_present(&mut self) {
-        if self.flags().contains(A::PTFlags::PRESENT) {
-            self.entry = A::make_private_address(self.entry);
-        }
+    fn make_pte_shared(&mut self) {
+        let flags = self.flags();
+        let addr = self.address();
+
+        // entry.address() returned with c-bit clear already
+        self.set(A::make_shared_address(addr), flags);
     }
+
+    fn make_pte_private(&mut self) {
+        let flags = self.flags();
+        let addr = self.address();
+
+        // entry.address() returned with c-bit clear already
+        self.set(A::make_private_address(addr), flags);
+    }
+
 
     /// Get the paddr field from the entry.
     ///
@@ -166,7 +170,7 @@ impl<A: ArchPagingMeta> PTEntry<A> {
 #[repr(C)]
 #[derive(Debug, FromZeros)]
 pub struct PTPage<A: ArchPagingMeta, P: PagingHandler> {
-    pub entries: [PTEntry<A>; ENTRY_COUNT],
+    entries: [PTEntry<A>; ENTRY_COUNT],
     _phantom: PhantomData<P>,
 }
 
@@ -191,14 +195,7 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
     /// # Safety
     /// The caller must ensure that the entry is valid and points to a valid page table.
     unsafe fn from_entry(entry: &PTEntry<A>) -> Option<&'_ Self> {
-        if !entry.present() || entry.huge() {
-            return None;
-        }
-
-        let address = P::paddr_to_vaddr(entry.address());
-        // SAFETY: Every PTEntry points to a previously allocated page-table
-        // page, so this pointer dereference is safe.
-        Some(unsafe { Self::from_vaddr(address) })
+        Self::from_entry_raw(entry).map(|ptr| unsafe { &*ptr })
     }
 
     /// Generates a `PTPage` from a virtual address.
@@ -208,6 +205,46 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
         // SAFETY: the caller guarantees the correctness of the virtual
         // address.
         unsafe { &mut *vaddr.as_mut_ptr::<Self>() }
+    }
+
+    pub(crate) fn from_entry_raw(entry: &PTEntry<A>) -> Option<*mut Self> {
+        if !entry.present() || entry.huge() {
+            return None;
+        }
+
+        let address = P::paddr_to_vaddr(entry.address());
+        // SAFETY: Every PTEntry points to a previously allocated page-table
+        // page, so this pointer dereference is safe.
+        Some(address.as_mut_ptr())
+    }
+
+    /// `*mut` pointer to the entry at `idx` within `page`.
+    pub(crate) fn entry_ptr(page: *const Self, idx: usize) -> *const PTEntry<A> {
+        (page as *const PTEntry<A>).wrapping_add(idx)
+    }
+
+    /// Recursively free all children page table pages starting from the level.
+    ///
+    /// # Safety
+    /// The caller must ensure that children tables are not in use by any other thread.
+    pub(crate) unsafe fn free_lvl(&self, level: PageLevel) {
+        if level <= PageLevel::Level0 {
+            return;
+        }
+        for entry in self.entries.iter() {
+            // SAFETY: `entry` belongs to this inactive table which, per the
+            // `free_lvl` contract, is not in use by any other thread, so the
+            // child page it points to is valid and uniquely owned.
+            if let Some(child) = unsafe { Self::from_entry(entry) } {
+                if let Some(next) = level.next_down() {
+                    // SAFETY: The child page table is not in use by any other thread.
+                    unsafe { child.free_lvl(next) };
+                }
+                let paddr = entry.address();
+                // SAFETY: the page was allocated via PagingHandler::allocate_physical_page.
+                unsafe { P::deallocate_physical_page(paddr) };
+            }
+        }
     }
 }
 
@@ -284,121 +321,22 @@ impl<A: ArchPagingMeta> PageFrame<A> {
     }
 }
 
-/// A page table rooted at `L::TOP_LEVEL`.
-///
-/// The root is a concrete page-table page (`PTPage`) whose level is described
-/// by `L`. This can represent either a complete top-level page table, such as
-/// a PML4-rooted table, or a lower-level subtree, such as a PDPT-rooted table
-/// that is installed into a top-level page table.
-///
-/// Ownership and synchronization are left to the OS-specific code.
-/// If a lower-level subtree is shared between multiple top-level page tables,
-/// all users of that subtree must coordinate updates to avoid concurrent
-/// modifications to the same page-table entries.
-#[repr(transparent)]
-#[derive(Debug, FromZeros)]
-pub struct GenericPageTable<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> {
-    pub(crate) root: PTPage<A, P>,
-    _level: PhantomData<L>,
-}
-
-/// Methods for page table hierarchies, independent of the self-map.
-impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P, L> {
-    pub(crate) fn root_pa(&self) -> PhysAddr {
-        P::vaddr_to_paddr(core::ptr::addr_of!(self.root).into())
-    }
-
-    pub fn cr3_value(&self) -> PhysAddr {
-        self.root_pa()
-    }
-
-    pub fn as_active(&mut self) -> ActivePageTableView<'_, A, P, L>
-    where
-        A: TlbOps,
-    {
-        ActivePageTableView::new(self as *mut _ as _)
-    }
-
-    /// Recursively free all page table pages starting from the root page.
-    ///
-    /// # Safety
-    /// The caller must ensure that children tables are not in use by any other thread.
-    unsafe fn free_lvl(page: &PTPage<A, P>, level: PageLevel) {
-        if level <= PageLevel::Level0 {
-            return;
-        }
-        for entry in page.entries.iter() {
-            // SAFETY: `entry` belongs to this inactive table which, per the
-            // `free_lvl` contract, is not in use by any other thread, so the
-            // child page it points to is valid and uniquely owned.
-            if let Some(child) = unsafe { PTPage::from_entry(entry) } {
-                if let Some(next) = level.next_down() {
-                    // SAFETY: The child page table is not in use by any other thread.
-                    unsafe { Self::free_lvl(child, next) };
-                }
-                let paddr = entry.address();
-                // SAFETY: the page was allocated via PagingHandler::allocate_physical_page.
-                unsafe { P::deallocate_physical_page(paddr) };
-            }
-        }
-    }
-
-    /// Free all page table pages starting from the root page.
-    /// We do not set it as a destructor because a page table may contain
-    /// shared sub-trees that may be in use by other root table.
-    ///
-    /// # Safety
-    /// The caller must ensure that the page table is not in use by any other thread.
-    pub unsafe fn free(&mut self) {
-        // # Safety: The caller must ensure that children page tables are not in use.
-        unsafe {
-            Self::free_lvl(&self.root, L::TOP_LEVEL);
-        }
-    }
-
-    /// Computes the index within a page table at the given level for a
-    /// virtual address `vaddr`.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address to compute the index for.
-    ///
-    /// # Returns
-    /// The index within the page table.
-    pub fn index<const LVL: usize>(vaddr: VirtAddr) -> usize {
-        vaddr.to_pgtbl_idx::<LVL>()
-    }
-
-    /// Walks a page table at level 0 to find a mapping.
-    ///
-    /// # Parameters
-    /// - `page`: A mutable reference to the root page table.
-    /// - `vaddr`: The virtual address to find a mapping for.
-    ///
-    /// # Returns
-    /// A `Mapping` representing the found mapping.
-    fn walk_addr_lvl0(page: &mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'_, A> {
-        let idx = vaddr.to_pgtbl_idx::<0>();
-        Mapping::new(PageLevel::Level0, &mut page[idx])
-    }
-}
-
 /// Methods that use the self-map to inspect the *active* top-level page table.
 ///
 /// Self-mapped address calculations assume a PML4-rooted table.
-impl<A: ArchPagingMeta, P: PagingHandler + SelfMap> GenericPageTable<A, P, PagingLevel3> {
+impl<A: ArchPagingMeta, P: PagingHandler + SelfMap> PTPage<A, P> {
     /// Install the self-map entry in a freshly zeroed page table.
     ///
     /// The self-map PML4 entry is written at [`SelfMap::SELFMAP_IDX`] and points
     /// at this page table's own root page.
     pub fn init_self_map(&mut self) {
-        let paddr = self.root_pa();
-        let entry = &mut self.root[P::SELFMAP_IDX];
+        let paddr = P::vaddr_to_paddr(core::ptr::addr_of!(self).into());
         let flags = A::PTFlags::self_map_table_flags();
-        entry.set(A::make_private_address(paddr), flags);
+        self[P::SELFMAP_IDX].set(A::make_private_address(paddr), flags);
     }
 }
 
-impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P, L> {
+impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
     /// Allocate from level 3 (PML4E) down to the target level.
     fn alloc_pte_lvl3(
         entry: &mut PTEntry<A>,
@@ -521,7 +459,8 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// - `entry`: The 2M page table entry to split.
     ///
     /// # Returns
-    /// A result indicating success or an error [`PagingError`] in failure.
+    /// A result containing the newly allocated page table page, or an error
+    /// [`PagingError`] in failure.
     fn do_split_4k(entry: &mut PTEntry<A>) -> Result<&'static mut PTPage<A, P>, PagingError> {
         let (page, paddr) = PTPage::<A, P>::alloc()?;
         let mut flags = entry.flags();
@@ -561,26 +500,11 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
             PageLevel::Level0 => Ok(mapping),
             PageLevel::Level1 => {
                 let next = Self::do_split_4k(mapping.entry)?;
-                Ok(Self::walk_addr_lvl0(next, vaddr))
+                let idx = vaddr.to_pgtbl_idx::<0>();
+                Ok(Mapping::new(PageLevel::Level0, &mut next.entries[idx]))
             }
             _ => Err(PagingError::NotMapped),
         }
-    }
-
-    fn make_pte_shared(entry: &mut PTEntry<A>) {
-        let flags = entry.flags();
-        let addr = entry.address();
-
-        // entry.address() returned with c-bit clear already
-        entry.set(A::make_shared_address(addr), flags);
-    }
-
-    fn make_pte_private(entry: &mut PTEntry<A>) {
-        let flags = entry.flags();
-        let addr = entry.address();
-
-        // entry.address() returned with c-bit clear already
-        entry.set(A::make_private_address(addr), flags);
     }
 
     /// Sets the shared state for a 4KB page.
@@ -600,7 +524,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
             entry,
         } = Self::split_4k(mapping, vaddr)?
         {
-            Self::make_pte_shared(entry);
+            entry.make_pte_shared();
             Ok(())
         } else {
             Err(PagingError::NotMapped)
@@ -624,7 +548,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
             entry,
         } = Self::split_4k(mapping, vaddr)?
         {
-            Self::make_pte_private(entry);
+            entry.make_pte_private();
             Ok(())
         } else {
             Err(PagingError::NotMapped)

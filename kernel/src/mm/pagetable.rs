@@ -651,7 +651,7 @@ impl Drop for PageTablePart {
             // SAFETY: the sub-tree is being dropped, so it must already have
             // been removed from any active page table and is no longer
             // reachable by the MMU;
-            unsafe { raw.as_inactive().free() }
+            unsafe { raw.free_children() }
         }
     }
 }
@@ -703,9 +703,6 @@ impl PageTablePart {
     }
 
     /// Populate this sub-tree into a top-level page table.
-    ///
-    /// The destination may be owned [`PageTableStorage`] or the currently
-    /// installed table; see [`Populate`].
     pub fn populate_by(&self, pgtbl: &mut PageTable) -> bool {
         self.get()
             .map(|p| pgtbl.populate(self.index(), p))

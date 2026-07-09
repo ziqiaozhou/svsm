@@ -5,7 +5,7 @@ use zerocopy::FromZeros;
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::pagetable::{
-    GenericPageTable, Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame, virt_from_lvl_idx,
+    Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame, virt_from_lvl_idx,
 };
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE_2M};
 use crate::tlb::{MayNeedFlush, TlbOps};
@@ -14,23 +14,7 @@ use crate::traits::{
     PagingLevel, PagingLevel3, SelfMap,
 };
 
-impl<A: ArchPagingMeta + TlbOps, P: PagingHandler> PTPage<A, P> {
-    fn from_entry_raw(entry: PTEntry<A>) -> Option<*mut Self> {
-        if !entry.present() || entry.huge() {
-            return None;
-        }
 
-        let address = P::paddr_to_vaddr(entry.address());
-        // SAFETY: Every PTEntry points to a previously allocated page-table
-        // page, so this pointer dereference is safe.
-        Some(address.as_mut_ptr())
-    }
-
-    /// `*mut` pointer to the entry at `idx` within `page`.
-    fn entry_ptr(page: *const Self, idx: usize) -> *const PTEntry<A> {
-        (page as *const PTEntry<A>).wrapping_add(idx)
-    }
-}
 
 /// The resolved result of a page-table walk on an *active* (installed)
 /// page table: the level at which the walk terminated, together with a
@@ -41,7 +25,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler> PTPage<A, P> {
 /// The ActiveMapping is an abstract type that is only created
 /// during a mutable page-table walk on an active page table.
 #[derive(Clone, Copy, Debug)]
-pub struct ActiveMapping<'a, P: ArchPagingMeta> {
+pub struct InstalledMapping<'a, P: ArchPagingMeta> {
     level: PageLevel,
     entry: *mut PTEntry<P>,
     _lifetime: PhantomData<&'a PTEntry<P>>,
@@ -49,14 +33,18 @@ pub struct ActiveMapping<'a, P: ArchPagingMeta> {
 
 /// An immutable version of `ActiveMapping`.
 /// This type is used to represent a mapping from an readable active page table.
+/// Its constructor is private to this module, and it is only created during a
+/// read-only page-table walk on an active page table.
+/// The lifetime parameter `'a` is shorter or equal to the lifetime of the active page table.
+/// It guarantees that the entry it points to will be valid for the duration of `'a`.
 #[derive(Clone, Copy, Debug)]
-struct ImmutableActiveMapping<'a, P: ArchPagingMeta> {
+struct ImmutableInstalledMapping<'a, P: ArchPagingMeta> {
     level: PageLevel,
     entry: *const PTEntry<P>,
     _lifetime: PhantomData<&'a PTEntry<P>>,
 }
 
-impl<'a, A: ArchPagingMeta> From<Mapping<'a, A>> for ActiveMapping<'a, A> {
+impl<'a, A: ArchPagingMeta> From<Mapping<'a, A>> for InstalledMapping<'a, A> {
     fn from(mapping: Mapping<'a, A>) -> Self {
         Self {
             level: mapping.level,
@@ -66,7 +54,7 @@ impl<'a, A: ArchPagingMeta> From<Mapping<'a, A>> for ActiveMapping<'a, A> {
     }
 }
 
-impl<A: ArchPagingMeta + TlbOps> ImmutableActiveMapping<'_, A> {
+impl<A: ArchPagingMeta + TlbOps> ImmutableInstalledMapping<'_, A> {
     pub fn read(self) -> PTEntry<A> {
         // SAFETY: A valid ImmutableActiveMapping must point to a valid PTEntry.
         // See more in the documentation for `ImmutableActiveMapping`.
@@ -78,7 +66,7 @@ impl<A: ArchPagingMeta + TlbOps> ImmutableActiveMapping<'_, A> {
     }
 }
 
-impl<A: ArchPagingMeta + TlbOps> ActiveMapping<'_, A> {
+impl<A: ArchPagingMeta + TlbOps> InstalledMapping<'_, A> {
     /// Volatile read of the entry this mapping points at.
     pub fn read(self) -> PTEntry<A> {
         // SAFETY: A valid ActiveMapping must point to a valid PTEntry.
@@ -86,7 +74,7 @@ impl<A: ArchPagingMeta + TlbOps> ActiveMapping<'_, A> {
         unsafe { PTEntry::read_pte(self.entry) }
     }
 
-    /// Create a new `ActiveMapping` with the given level and entry.
+    /// Create a new `InstalledMapping` with the given level and entry.
     pub fn update(self, entry: PTEntry<A>) -> MayNeedFlush<A> {
         // SAFETY: A valid ActiveMapping must point to a valid PTEntry.
         // See more in the documentation for `ActiveMapping`.
@@ -102,11 +90,29 @@ impl<A: ArchPagingMeta + TlbOps> ActiveMapping<'_, A> {
     }
 }
 
-/// ActivePageTable is a wrapper around an active page table.
-/// It uses UnsafeCell to disable the Rust's assumption of aliasing, so that compiler
-/// will not optimize away the reads and writes to the page table entries.
-/// Since page table might be updated by hardware, we cannot use UnsafeCell::get_mut().
-/// Accessed to the entries must be done through volatile or even atomic reads and writes.
+/// An *installed* (active) page table.
+/// 
+/// The root is a concrete page-table page whose level is described
+/// by `L`. This can represent either a complete top-level page table, such as
+/// a PML4-rooted table, or a lower-level subtree, such as a PDPT-rooted table
+/// that is installed into a top-level page table.
+///
+/// Ownership and synchronization are left to the OS-specific code.
+/// If a lower-level subtree is shared between multiple top-level page tables,
+/// all users of that subtree must coordinate updates to avoid concurrent
+/// modifications to the same page-table entries.
+///
+/// The root page is stored in an [`UnsafeCell`](core::cell::UnsafeCell) so the
+/// compiler does not treat its contents as immutable / `noalias` when holding a
+/// shared reference. This is required because the MMU may concurrently update
+/// entries (e.g. the accessed/dirty bits) while the table is live.
+///
+/// The `UnsafeCell` alone is not enough: all entry accesses must go through the
+/// raw pointer from [`UnsafeCell::get`](core::cell::UnsafeCell::get) using
+/// **volatile** (or atomic) reads and writes. Never form a `&` or `&mut`
+/// reference into an installed table — that would assert the absence of
+/// concurrent mutation and is undefined behavior, and it would also let the
+/// compiler elide or reorder the accesses.
 #[repr(transparent)]
 #[derive(Debug, FromZeros)]
 pub struct ActivePageTable<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> {
@@ -132,20 +138,23 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     /// # Safety
     /// The caller must guarantee that the root is a valid, page-aligned pointer
     /// to a root page-table page that remains valid for the lifetime of the implementor.
-    pub fn new(inactive: GenericPageTable<A, P, L>) -> Self {
+    pub fn new(inactive: PTPage<A, P>) -> Self {
         Self {
-            root: core::cell::UnsafeCell::new(inactive.root),
+            root: core::cell::UnsafeCell::new(inactive),
             _level: PhantomData,
         }
     }
 
+    /// Computes the index within a page table at the given level for a
+    /// virtual address `vaddr`.
+    ///
+    /// # Parameters
+    /// - `vaddr`: The virtual address to compute the index for.
+    ///
+    /// # Returns
+    /// The index within the page table.
     pub fn index<const LVL: usize>(vaddr: VirtAddr) -> usize {
-        GenericPageTable::<A, P, L>::index::<LVL>(vaddr)
-    }
-
-    /// Get a mutable view of the active page table.
-    pub fn get_view(&mut self) -> ActivePageTableView<'_, A, P, L> {
-        ActivePageTableView::new(self as _)
+        vaddr.to_pgtbl_idx::<LVL>()
     }
 
     fn root_page(&self) -> *const PTPage<A, P> {
@@ -163,20 +172,24 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     /// reachable by the MMU on any CPU, for the duration of the borrow.
     /// Inactive access forms `&mut` references into the table and would be
     /// unsound on a live table.
-    pub unsafe fn as_inactive(&mut self) -> &mut GenericPageTable<A, P, L> {
+    pub unsafe fn as_inactive(&mut self) -> &mut PTPage<A, P> {
         // SAFETY: `GenericPageTable` and `ActivePageTableNode` share the same
         // backing root page layout, and the caller guarantees the table is not
         // installed, so forming a `&mut` into it is sound.
-        unsafe { &mut *(self.root_page() as *mut GenericPageTable<A, P, L>) }
+        unsafe { &mut *(self.root_page() as *mut PTPage<A, P>) }
+    }
+
+    pub unsafe fn free_children(&mut self) {
+        unsafe { self.as_inactive().free_lvl(L::TOP_LEVEL); }
     }
 
     /// Get the next level page table view at the given index.
     /// Returns None if the entry is not present or is a huge page.
-    pub fn next_table(&self, idx: usize) -> Option<ActivePageTableView<'_, A, P, L::Next>>
+    pub fn next_table(&self, idx: usize) -> Option<ActivePageTableRef<'_, A, P, L::Next>>
     where
         L: NextLevel,
     {
-        let mapping = ImmutableActiveMapping {
+        let mapping = ImmutableInstalledMapping {
             level: L::TOP_LEVEL,
             entry: PTPage::entry_ptr(self.root_page(), idx),
             _lifetime: PhantomData,
@@ -185,7 +198,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
         if !entry.present() || entry.huge() {
             return None;
         }
-        Some(ActivePageTableView {
+        Some(ActivePageTableRef {
             ptr: P::paddr_to_vaddr(entry.address()).as_mut_ptr(),
             _level: PhantomData,
         })
@@ -195,29 +208,15 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     /// [`ActiveMapping`] (level and raw entry pointer) at which the walk
     /// terminated.
     /// This is the only entry to get an [`ActiveMapping`] from an active page table.
-    pub fn walk_mut(&mut self, vaddr: VirtAddr) -> ActiveMapping<'_, A> {
-        let tbl_view = ActivePageTableView::<A, P, L> {
+    pub fn walk_mut(&mut self, vaddr: VirtAddr) -> InstalledMapping<'_, A> {
+        let tbl_view = ActivePageTableRef::<A, P, L> {
             ptr: self,
             _level: PhantomData,
         };
         let m = tbl_view.walk(vaddr);
-        ActiveMapping {
+        InstalledMapping {
             level: m.level,
             entry: m.entry as *mut PTEntry<A>,
-            _lifetime: PhantomData,
-        }
-    }
-
-    /// Mutable view of the top-level entry at `idx`.
-    ///
-    /// Takes `&mut self` even though it only reads the root pointer: the
-    /// returned [`ActiveMapping`] can write the entry, so it must be tied to an
-    /// exclusive borrow of the table.
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    fn top_entry_mut(&mut self, idx: usize) -> ActiveMapping<'_, A> {
-        ActiveMapping {
-            level: L::TOP_LEVEL,
-            entry: PTPage::entry_ptr(self.root_page(), idx) as *mut PTEntry<A>,
             _lifetime: PhantomData,
         }
     }
@@ -227,23 +226,24 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     ///
     /// The walk descends through present, non-huge entries and stops at the
     /// leaf (`Level0`), at the first absent entry, or at a huge entry.
-    fn walk<'a>(&'a self, vaddr: VirtAddr) -> ImmutableActiveMapping<'a, A> {
+    fn walk<'a>(&'a self, vaddr: VirtAddr) -> ImmutableInstalledMapping<'a, A> {
         let page = self.root_page();
         let level = L::TOP_LEVEL;
         let idx = (vaddr.as_usize() >> (PAGE_SHIFT + level as usize * PTE_SHIFT)) & 0x1FF;
-        let mut mapping = ImmutableActiveMapping {
+        let mut mapping = ImmutableInstalledMapping {
             level,
             entry: PTPage::entry_ptr(page, idx),
             _lifetime: PhantomData,
         };
         for _ in 0..L::TOP_LEVEL as usize {
-            match PTPage::<A, P>::from_entry_raw(mapping.read()) {
+            let entry = mapping.read();
+            match PTPage::<A, P>::from_entry_raw(&entry) {
                 Some(next) => {
                     let level = mapping
                         .level
                         .next_down()
                         .expect("non-leaf level has a child");
-                    mapping = ImmutableActiveMapping {
+                    mapping = ImmutableInstalledMapping {
                         level,
                         entry: PTPage::entry_ptr(next, idx),
                         _lifetime: PhantomData,
@@ -274,7 +274,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
         &'a mut self,
         vaddr: VirtAddr,
         entry: &'b mut PTEntry<A>,
-    ) -> (Mapping<'b, A>, ActiveMapping<'a, A>) {
+    ) -> (Mapping<'b, A>, InstalledMapping<'a, A>) {
         let m = self.walk_mut(vaddr);
         *entry = m.read();
 
@@ -303,7 +303,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     ) -> Result<(), PagingError> {
         let mut entry = PTEntry::empty();
         let (mapping, active_m) = self.walk_for_update(vaddr, &mut entry);
-        GenericPageTable::<A, P, L>::do_map_4k_with_parent_flags(
+        PTPage::<A, P>::do_map_4k_with_parent_flags(
             mapping,
             vaddr,
             paddr,
@@ -360,7 +360,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     ) -> Result<(), PagingError> {
         let mut entry = PTEntry::empty();
         let (mapping, active_m) = self.walk_for_update(vaddr, &mut entry);
-        GenericPageTable::<A, P, L>::do_map_2m_with_parent_flags(
+        PTPage::<A, P>::do_map_2m_with_parent_flags(
             mapping,
             vaddr,
             paddr,
@@ -409,7 +409,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     pub fn unmap_4k(&mut self, vaddr: VirtAddr) -> Option<(PTEntry<A>, MayNeedFlush<A>)> {
         let mut entry = PTEntry::empty();
         let (m, active_m) = self.walk_for_update(vaddr, &mut entry);
-        GenericPageTable::<A, P, L>::do_unmap_4k(m).map(|e| (e, active_m.update(entry)))
+        PTPage::<A, P>::do_unmap_4k(m).map(|e| (e, active_m.update(entry)))
     }
 
     /// Unmaps a 2MB page.
@@ -427,7 +427,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     pub fn unmap_2m(&mut self, vaddr: VirtAddr) -> Option<(PTEntry<A>, MayNeedFlush<A>)> {
         let mut entry = PTEntry::empty();
         let (m, active_m) = self.walk_for_update(vaddr, &mut entry);
-        GenericPageTable::<A, P, L>::do_unmap_2m(m).map(|e| (e, active_m.update(entry)))
+        PTPage::<A, P>::do_unmap_2m(m).map(|e| (e, active_m.update(entry)))
     }
 
     /// Sets the shared state for a 4KB page.
@@ -441,7 +441,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     pub fn set_shared_4k(&mut self, vaddr: VirtAddr) -> Result<MayNeedFlush<A>, PagingError> {
         let mut entry = PTEntry::empty();
         let (m, active_m) = self.walk_for_update(vaddr, &mut entry);
-        GenericPageTable::<A, P, L>::do_set_shared_4k(m, vaddr)?;
+        PTPage::<A, P>::do_set_shared_4k(m, vaddr)?;
         Ok(active_m.update(entry))
     }
 
@@ -455,7 +455,7 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
     pub fn set_encrypted_4k(&mut self, vaddr: VirtAddr) -> Result<MayNeedFlush<A>, PagingError> {
         let mut entry = PTEntry::empty();
         let (m, active_m) = self.walk_for_update(vaddr, &mut entry);
-        GenericPageTable::<A, P, L>::do_set_encrypted_4k(m, vaddr)?;
+        PTPage::<A, P>::do_set_encrypted_4k(m, vaddr)?;
         Ok(active_m.update(entry))
     }
 
@@ -495,7 +495,11 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> ActivePageTab
             A::make_private_address(child.root_pa()),
             A::PTFlags::parent_flags(),
         );
-        let mapping = self.top_entry_mut(idx);
+        let mapping = InstalledMapping {
+            level: L::TOP_LEVEL,
+            entry: PTPage::entry_ptr(self.root_page(), idx) as *mut PTEntry<A>,
+            _lifetime: PhantomData,
+        };
         let old = mapping.read();
         if old.raw() == desired.raw() {
             return false;
@@ -589,13 +593,13 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler + SelfMap> ActivePageTable<A, 
 }
 
 #[derive(Debug)]
-pub struct ActivePageTableView<'a, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> {
+pub struct ActivePageTableRef<'a, A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> {
     ptr: *mut ActivePageTable<A, P, L>,
     _level: PhantomData<(&'a (), A, P, L)>,
 }
 
 impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> Deref
-    for ActivePageTableView<'_, A, P, L>
+    for ActivePageTableRef<'_, A, P, L>
 {
     type Target = ActivePageTable<A, P, L>;
 
@@ -607,22 +611,11 @@ impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> Deref
 }
 
 impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel> DerefMut
-    for ActivePageTableView<'_, A, P, L>
+    for ActivePageTableRef<'_, A, P, L>
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: see `deref`; the exclusive borrow of the view grants
         // exclusive access to the pointed-to node.
         unsafe { self.ptr.as_mut().unwrap() }
-    }
-}
-
-impl<A: ArchPagingMeta + TlbOps, P: PagingHandler, L: PagingLevel>
-    ActivePageTableView<'_, A, P, L>
-{
-    pub(crate) fn new(ptr: *mut ActivePageTable<A, P, L>) -> Self {
-        Self {
-            ptr,
-            _level: PhantomData,
-        }
     }
 }
