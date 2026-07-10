@@ -352,7 +352,7 @@ pub struct Task {
     pub shadow_stack_base: VirtAddr,
 
     /// Page table that is loaded when the task is scheduled
-    pub page_table: SpinLock<PageBox<PageTable>>,
+    pub page_table: SpinLock<PageTable>,
 
     /// Task kernel stack mapping
     _kernel_stack: TaskKernelMapping,

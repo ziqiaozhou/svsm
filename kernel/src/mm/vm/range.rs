@@ -116,7 +116,7 @@ impl VMR {
         for idx in 0..count {
             let mut part = PageTablePart::new(start + (idx * VMR_GRANULE));
             if !lazy {
-                part.alloc();
+                part.alloc()?;
             }
             vec.push(part);
         }

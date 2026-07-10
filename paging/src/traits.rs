@@ -52,9 +52,14 @@ impl PageLevel {
 ///
 /// Architecture-specific ZSTs that implement this trait live in their
 /// respective modules (e.g. `x86_64::Pml4Level`).
-pub trait PagingLevel {
+pub trait PagingLevel: 'static {
     /// Highest page table level.
     const TOP_LEVEL: PageLevel;
+}
+
+pub trait NextLevel: PagingLevel {
+    /// The next level down from this one.
+    type Next: PagingLevel;
 }
 
 #[derive(Debug)]
@@ -64,6 +69,10 @@ impl PagingLevel for PagingLevel3 {
     const TOP_LEVEL: PageLevel = PageLevel::Level3;
 }
 
+impl NextLevel for PagingLevel3 {
+    type Next = PagingLevel2;
+}
+
 #[derive(Debug)]
 pub struct PagingLevel2;
 
@@ -71,6 +80,27 @@ impl PagingLevel for PagingLevel2 {
     const TOP_LEVEL: PageLevel = PageLevel::Level2;
 }
 
+impl NextLevel for PagingLevel2 {
+    type Next = PagingLevel1;
+}
+
+#[derive(Debug)]
+pub struct PagingLevel1;
+
+impl PagingLevel for PagingLevel1 {
+    const TOP_LEVEL: PageLevel = PageLevel::Level1;
+}
+
+impl NextLevel for PagingLevel1 {
+    type Next = PagingLevel0;
+}
+
+#[derive(Debug)]
+pub struct PagingLevel0;
+
+impl PagingLevel for PagingLevel0 {
+    const TOP_LEVEL: PageLevel = PageLevel::Level0;
+}
 /// Errors that can occur during page table operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PagingError {
@@ -200,6 +230,8 @@ pub unsafe trait PagingHandler: 'static + FromBytes {
     /// Translate a clean physical address to a virtual address suitable for
     /// accessing page table pages.
     fn paddr_to_vaddr(paddr: PhysAddr) -> VirtAddr;
+
+    fn vaddr_to_paddr(vaddr: VirtAddr) -> PhysAddr;
 
     /// Allocate a zeroed page-table frame.
     ///

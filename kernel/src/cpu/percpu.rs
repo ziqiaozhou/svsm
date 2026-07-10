@@ -66,6 +66,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::cell::UnsafeCell;
+use core::mem::ManuallyDrop;
 use core::mem::offset_of;
 use core::mem::size_of;
 use core::ops::Deref;
@@ -664,19 +665,21 @@ impl PerCpu {
         self.shared().apic_id()
     }
 
-    pub fn init_page_table(&self, pgtable: PageBox<PageTable>) -> Result<(), SvsmError> {
+    pub fn init_page_table(&self, pgtable: PageTable) -> Result<(), SvsmError> {
         // SAFETY: The per-CPU address range is fully aligned to top-level
         // paging boundaries.
         unsafe {
             self.vm_range.initialize()?;
         }
-        self.set_pgtable(PageBox::leak(pgtable));
+        self.set_pgtable(ManuallyDrop::new(pgtable));
 
         Ok(())
     }
 
-    pub fn set_pgtable(&self, pgtable: &'static mut PageTable) {
-        let vaddr = VirtAddr::from(ptr::from_ref(pgtable) as usize);
+    /// Stores the page table root address.
+    /// It requires that we never drop the `PageTable` after storing its root address.
+    pub fn set_pgtable(&self, pgtable: ManuallyDrop<PageTable>) {
+        let vaddr = VirtAddr::from(pgtable.root_page());
         self.pgtbl
             .compare_exchange(0, vaddr.into(), Ordering::Relaxed, Ordering::Relaxed)
             .unwrap();
@@ -746,14 +749,15 @@ impl PerCpu {
     }
 
     pub fn get_pgtable(&self) -> &'static mut PageTable {
-        // SAFETY: `self.pgtbl` is a write-once variable that holds the
-        // physical address of this processor's paging root.  It is stored as
-        // an `AtomicUsize` so it can be read from contexts that cannot
-        // acquire locks.
-        unsafe {
-            let mut p = NonNull::new(self.pgtbl.load(Ordering::Relaxed) as *mut PageTable).unwrap();
-            p.as_mut()
-        }
+        // SAFETY: `self.pgtbl` is a write-once variable that holds the virtual
+        // address of this processor's paging root (a `*mut PTPage`). It is
+        // stored as an `AtomicUsize` so it can be read from contexts that cannot
+        // acquire locks. `PageTable` is `#[repr(transparent)]` over a single
+        // `*mut PTPage`, so `as_ptr()` (the address of the atomic's storage
+        // cell, not its value) reinterpreted as `*mut PageTable` yields a handle
+        // whose `root` field equals the stored root pointer. The cell lives in
+        // the `'static` per-CPU area and the overlaid handle is never dropped.
+        unsafe { &mut *(self.pgtbl.as_ptr() as *mut PageTable) }
     }
 
     /// Registers an already set up GHCB page for this CPU.
@@ -826,11 +830,7 @@ impl PerCpu {
         self.vm_range.dump_ranges();
     }
 
-    pub fn setup(
-        &self,
-        platform: &dyn SvsmPlatform,
-        pgtable: PageBox<PageTable>,
-    ) -> Result<(), SvsmError> {
+    pub fn setup(&self, platform: &dyn SvsmPlatform, pgtable: PageTable) -> Result<(), SvsmError> {
         self.init_page_table(pgtable)?;
 
         // Map PerCpu data in own page-table

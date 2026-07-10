@@ -25,12 +25,10 @@ use core::ptr::NonNull;
 use cpuarch::x86::CR0Flags;
 use cpuarch::x86::CR4Flags;
 use cpuarch::x86::EFERFlags;
-use paging::ptpage::{
-    ArchPagingMeta, GenericPageTable, PageLevel, PagingError, PagingHandler, SelfMap,
-};
+use paging::pagetable::GenericPageTable;
+use paging::ptpage::{ArchPagingMeta, PageLevel, PagingError, PagingHandler, SelfMap};
 use paging::tlb::MayNeedFlush;
 use zerocopy::FromBytes;
-use zerocopy::FromZeros;
 
 /// Re-export types from the paging crate.
 pub use paging::x86_64::{PTEntryFlags, PdptLevel, Pml4Level};
@@ -200,8 +198,12 @@ unsafe impl PagingHandler for SvsmPaging {
         phys_to_virt(paddr)
     }
 
+    fn vaddr_to_paddr(vaddr: VirtAddr) -> PhysAddr {
+        virt_to_phys(vaddr)
+    }
+
     fn allocate_physical_page() -> Result<PhysAddr, PagingError> {
-        let page = pt_page_alloc_box().map_err(|_| PagingError::AllocFrame)?;
+        let page = PageBox::<PTPage>::try_new_uninit().map_err(|_| PagingError::AllocFrame)?;
         let paddr = virt_to_phys(page.vaddr());
         let _ = PageBox::leak(page);
         Ok(paddr)
@@ -264,9 +266,6 @@ pub type PTEntry = paging::ptpage::PTEntry<SvsmPaging>;
 
 /// A pagetable page with multiple entries.
 pub type PTPage = paging::ptpage::PTPage<SvsmPaging, SvsmPaging>;
-
-/// Mapping levels of page table entries.
-pub type Mapping<'a> = paging::ptpage::Mapping<'a, SvsmPaging>;
 
 /// A physical address within a page frame
 pub type PageFrame = paging::ptpage::PageFrame<SvsmPaging>;
@@ -371,19 +370,14 @@ impl PTEntryExt for PTEntry {
     }
 }
 
-fn pt_page_alloc_box() -> Result<PageBox<PTPage>, SvsmError> {
-    PageBox::try_new_zeroed()
-}
-
 /// Inner type alias to simplify references to the fully-parameterized generic page table.
-type SvsmPageTable = GenericPageTable<SvsmPaging, SvsmPaging, Pml4Level>;
+pub type SvsmPageTable = GenericPageTable<SvsmPaging, SvsmPaging, Pml4Level>;
 
 /// Represents a sub-tree of a page-table which can be mapped at a top-level index
-type RawPageTablePart = GenericPageTable<SvsmPaging, SvsmPaging, PdptLevel>;
+pub type RawPageTablePart = GenericPageTable<SvsmPaging, SvsmPaging, PdptLevel>;
 
-/// Page table structure containing a root page with multiple entries.
-#[repr(C)]
-#[derive(Debug, FromZeros)]
+#[derive(Debug)]
+#[repr(transparent)]
 pub struct PageTable(SvsmPageTable);
 
 impl Deref for PageTable {
@@ -400,6 +394,22 @@ impl DerefMut for PageTable {
 }
 
 impl PageTable {
+    /// Wrap an externally-owned root page (e.g. the boot page table).
+    ///
+    /// # Safety
+    /// The caller must guarantee that `root` is a valid, page-aligned pointer
+    /// to a root page-table page that remains valid for the lifetime of the
+    /// returned handle.
+    pub unsafe fn from_ptr(root: *mut PTPage) -> Self {
+        // SAFETY: guaranteed by the caller.
+        PageTable(unsafe { SvsmPageTable::from_ptr(root) })
+    }
+
+    /// Virtual address of the root page-table page.
+    pub fn root_va(&self) -> VirtAddr {
+        self.0.root_page().into()
+    }
+
     /// Load the current page table into the CR3 register.
     ///
     /// # Safety
@@ -411,12 +421,6 @@ impl PageTable {
         unsafe {
             write_cr3(self.cr3_value());
         }
-    }
-
-    /// Get the CR3 register value for the current page table.
-    pub fn cr3_value(&self) -> PhysAddr {
-        let pgtable = VirtAddr::from(self as *const Self);
-        virt_to_phys(pgtable)
     }
 
     /// Computes the index within a page table at the given level for a
@@ -449,10 +453,13 @@ impl PageTable {
     ///
     /// # Errors
     /// Returns [`SvsmError`] if the page cannot be allocated.
-    fn allocate_new() -> Result<PageBox<Self>, SvsmError> {
-        let mut pgtable: PageBox<Self> = PageBox::try_new_zeroed()?;
-        let paddr = virt_to_phys(pgtable.vaddr());
-        pgtable.init_self_map(paddr);
+    fn allocate_new() -> Result<PageTable, SvsmError> {
+        let mut pgtable = PageTable(SvsmPageTable::alloc()?);
+        let root_pa = pgtable.root_pa();
+        // SAFETY: The page table is newly allocated and zeroed, so it is safe to initialize the self-map.
+        unsafe {
+            pgtable.as_inactive().init_self_map(root_pa);
+        }
         Ok(pgtable)
     }
 
@@ -461,41 +468,12 @@ impl PageTable {
     ///
     /// # Errors
     /// Returns [`SvsmError`] if the page cannot be allocated.
-    pub fn clone_shared(&self) -> Result<PageBox<PageTable>, SvsmError> {
+    pub fn clone_shared(&self) -> Result<PageTable, SvsmError> {
         let mut pgtable = Self::allocate_new()?;
-        pgtable.copy_entry(self, PGTABLE_LVL3_IDX_SHARED);
+        self.next_table_pa(PGTABLE_LVL3_IDX_SHARED)
+            .map(|pa| pgtable.populate(PGTABLE_LVL3_IDX_SHARED, pa));
+
         Ok(pgtable)
-    }
-
-    /// Gets the physical address for a mapped `vaddr` or `None` if
-    /// no such mapping exists.
-    pub fn check_mapping(&mut self, vaddr: VirtAddr) -> Option<PhysAddr> {
-        let mapping = self.walk_addr(vaddr);
-        match mapping.level {
-            PageLevel::Level0 | PageLevel::Level1 => Some(mapping.entry.address()),
-            _ => None,
-        }
-    }
-
-    /// Maps a 4KB page.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address to map.
-    /// - `paddr`: The physical address to map to.
-    /// - `flags`: The flags to apply to the mapping.
-    /// - `shared`: Indicates whether the mapping is shared.
-    ///
-    /// # Returns
-    /// A result indicating success or failure ([`SvsmError`]).
-    pub fn map_4k(
-        &mut self,
-        vaddr: VirtAddr,
-        paddr: PhysAddr,
-        flags: PTEntryFlags,
-        shared: bool,
-    ) -> Result<(), SvsmError> {
-        self.0.map_4k(vaddr, paddr, flags, shared)?;
-        Ok(())
     }
 
     /// Maps a region of memory using 4KB pages.
@@ -516,8 +494,7 @@ impl PageTable {
         shared: bool,
     ) -> Result<(), SvsmError> {
         let (start, end) = (vregion.start(), vregion.end());
-        self.0
-            .map_region_4k(start, end, phys, flags, shared)?;
+        self.0.map_region_4k(start, end, phys, flags, shared)?;
         Ok(())
     }
 
@@ -529,11 +506,7 @@ impl PageTable {
         let (start, end) = (vregion.start(), vregion.end());
         let flush = self.0.unmap_region_4k(start, end);
         if let TlbFlushRange::Range { region, pgsize } = flush.scope().unwrap().range {
-            assert!(
-                region.start() == start
-                    && region.end() == end
-                    && pgsize == PageSize::Regular
-            );
+            assert!(region.start() == start && region.end() == end && pgsize == PageSize::Regular);
         }
         flush
     }
@@ -609,15 +582,9 @@ impl PageTable {
     ///
     /// Returns `true` if the PTE contents were updated.
     pub fn populate_pgtbl_part(&mut self, part: &PageTablePart) -> (bool, SvsmMayNeedFlush) {
-        let Some(paddr) = part.address() else {
-            return (false, SvsmMayNeedFlush::none());
-        };
-        let idx = part.index();
-        let flags = PTEntryFlags::PRESENT
-            | PTEntryFlags::WRITABLE
-            | PTEntryFlags::USER
-            | PTEntryFlags::ACCESSED;
-        self.set_entry(idx, SvsmPaging::make_private_address(paddr), flags)
+        part.get()
+            .map(|p| self.populate(part.index(), p.root_pa()))
+            .unwrap_or((false, SvsmMayNeedFlush::none()))
     }
 
     /// Makes the memory region pages read-only.
@@ -638,12 +605,12 @@ impl PageTable {
         &mut self,
         region: MemoryRegion<VirtAddr>,
     ) -> Result<SvsmMayNeedFlush, SvsmError> {
+        let mut flush = SvsmMayNeedFlush::none();
         for page in region.iter_pages(PageSize::Regular) {
-            match self.walk_addr(page) {
-                Mapping {
-                    level: PageLevel::Level0,
-                    entry,
-                } => {
+            let mapping = self.walk_mut(page);
+            match mapping.level() {
+                PageLevel::Level0 => {
+                    let mut entry = mapping.read();
                     if !entry.present() || !entry.flags().global() {
                         return Err(SvsmError::Mem);
                     }
@@ -653,11 +620,12 @@ impl PageTable {
                     let paddr_field = entry.paddr_field();
 
                     entry.set(paddr_field, flags);
+                    // The caller flushes the whole region at once below, via
+                    // the token returned after the loop.
+                    flush = flush.and(mapping.update(entry));
                 }
-                Mapping {
-                    level: PageLevel::Level1 | PageLevel::Level2,
-                    entry,
-                } => {
+                PageLevel::Level1 | PageLevel::Level2 => {
+                    let entry = mapping.read();
                     // Ensure we never fell on a huge page while iterating over the region pages.
                     if entry.huge() {
                         return Err(SvsmError::Mem);
@@ -667,11 +635,7 @@ impl PageTable {
             }
         }
 
-        Ok(SvsmMayNeedFlush::new_range(
-            region.start(),
-            region.end(),
-            PageLevel::Level0,
-        ))
+        Ok(flush)
     }
 }
 
@@ -680,15 +644,18 @@ impl PageTable {
 #[derive(Debug)]
 pub struct PageTablePart {
     /// The root of the page-table sub-tree
-    raw: Option<PageBox<RawPageTablePart>>,
+    raw: Option<RawPageTablePart>,
     /// The top-level index this PageTablePart is populated at
     idx: usize,
 }
 
 impl Drop for PageTablePart {
     fn drop(&mut self) {
-        if let Some(raw) = self.raw.as_deref() {
-            raw.free()
+        if let Some(raw) = self.raw.as_mut() {
+            // SAFETY: the sub-tree is being dropped, so it must already have
+            // been removed from any active page table and is no longer
+            // reachable by the MMU;
+            unsafe { raw.free_children() }
         }
     }
 }
@@ -710,22 +677,24 @@ impl PageTablePart {
         }
     }
 
-    pub fn alloc(&mut self) {
-        self.get_or_init_mut();
+    pub fn alloc(&mut self) -> Result<(), SvsmError> {
+        self.get_or_init_mut()?;
+        Ok(())
     }
 
-    fn get_or_init_mut(&mut self) -> &mut RawPageTablePart {
-        self.raw.get_or_insert_with(|| {
-            PageBox::try_new_zeroed().expect("Failed to allocate page table page")
-        })
+    fn get_or_init_mut(&mut self) -> Result<&mut RawPageTablePart, SvsmError> {
+        if self.raw.is_none() {
+            self.raw = Some(RawPageTablePart::alloc()?);
+        }
+        Ok(self.raw.as_mut().unwrap())
     }
 
     fn get_mut(&mut self) -> Option<&mut RawPageTablePart> {
-        self.raw.as_deref_mut()
+        self.raw.as_mut()
     }
 
     fn get(&self) -> Option<&RawPageTablePart> {
-        self.raw.as_deref()
+        self.raw.as_ref()
     }
 
     /// Request PageTable index to populate this instance to
@@ -735,17 +704,6 @@ impl PageTablePart {
     /// Index of the top-level PageTable this sub-tree is populated to
     pub fn index(&self) -> usize {
         self.idx
-    }
-
-    /// Request physical base address of the page-table sub-tree. This is
-    /// needed to populate the PageTablePart.
-    ///
-    /// # Returns
-    ///
-    /// Physical base address of the page-table sub-tree
-    pub fn address(&self) -> Option<PhysAddr> {
-        self.get()
-            .map(|p| virt_to_phys(VirtAddr::from(p as *const RawPageTablePart)))
     }
 
     /// Map a 4KiB page in the page table sub-tree
@@ -775,7 +733,7 @@ impl PageTablePart {
     ) -> Result<(), SvsmError> {
         assert!(PageTable::index::<3>(vaddr) == self.idx);
 
-        self.get_or_init_mut()
+        self.get_or_init_mut()?
             .map_4k(vaddr, paddr, flags, shared)
             .map_err(|_| SvsmError::Mem)
     }
@@ -828,7 +786,7 @@ impl PageTablePart {
     ) -> Result<(), SvsmError> {
         assert!(PageTable::index::<3>(vaddr) == self.idx);
 
-        self.get_or_init_mut()
+        self.get_or_init_mut()?
             .map_2m(vaddr, paddr, flags, shared)
             .map_err(|_| SvsmError::Mem)
     }
