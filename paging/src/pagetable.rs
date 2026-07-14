@@ -149,14 +149,9 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// # Errors
     /// Returns [`PagingError`] if the backing page cannot be allocated.
     pub fn alloc() -> Result<Self, PagingError> {
-        let paddr = P::allocate_physical_page()?;
-        let vaddr = P::paddr_to_vaddr(paddr);
-        let root_page = vaddr.as_mut_ptr::<PTPage<A, P>>();
-        // The physical page has just been allocated, so we need to zero it before use.
-        // SAFETY: The page is just allocated and so it is valid to write to it.
-        unsafe { &mut *root_page }.zero();
+        let (page, _paddr) = PTPage::<A, P>::alloc()?;
         Ok(Self {
-            root: vaddr,
+            root: page.into(),
             _level: PhantomData,
         })
     }

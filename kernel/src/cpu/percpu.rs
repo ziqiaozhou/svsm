@@ -748,7 +748,8 @@ impl PerCpu {
         Ok(())
     }
 
-    pub fn get_pgtable(&self) -> &'static mut PageTable {
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_pgtable(&self) -> &mut PageTable {
         // SAFETY: `self.pgtbl` is a write-once variable that holds the virtual
         // address of this processor's paging root (a `*mut PTPage`). It is
         // stored as an `AtomicUsize` so it can be read from contexts that cannot

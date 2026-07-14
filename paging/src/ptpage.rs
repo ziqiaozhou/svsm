@@ -180,14 +180,13 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
     /// # Errors
     ///
     /// Returns [`PagingError`] if the page cannot be allocated.
-    fn alloc() -> Result<(&'static mut PTPage<A, P>, PhysAddr), PagingError> {
+    pub(crate) fn alloc() -> Result<(*mut PTPage<A, P>, PhysAddr), PagingError> {
         let paddr = P::allocate_physical_page()?;
-        let vaddr = P::paddr_to_vaddr(paddr);
-        // SAFETY: allocate_physical_page returns a unique, zeroed frame and
-        // paddr_to_vaddr returns a valid virtual mapping for it.
-        let page = unsafe { Self::from_vaddr(vaddr) };
-        page.zero();
-        Ok((page, paddr))
+        let ptr = P::paddr_to_vaddr(paddr).as_mut_ptr::<Self>();
+        // SAFETY: allocate_physical_page returns a unique and new physical page, so this
+        // scoped reference is the only one to the page.
+        unsafe { (*ptr).zero() };
+        Ok((ptr, paddr))
     }
 
     /// Converts a pagetable entry to a mutable reference to a [`PTPage`],
@@ -354,6 +353,10 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
 
         entry.set(A::make_private_address(paddr), parent_flags);
 
+        // SAFETY: `page` was freshly allocated by `alloc` and just installed
+        // into `entry`; it is exclusively owned here and not yet reachable by
+        // any other thread.
+        let page = unsafe { &mut *page };
         let idx = vaddr.to_pgtbl_idx::<2>();
         Self::alloc_pte_lvl2(&mut page[idx], vaddr, size, parent_flags)
     }
@@ -375,6 +378,10 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
 
         entry.set(A::make_private_address(paddr), parent_flags);
 
+        // SAFETY: `page` was freshly allocated by `alloc` and just installed
+        // into `entry`; it is exclusively owned here and not yet reachable by
+        // any other thread.
+        let page = unsafe { &mut *page };
         let idx = vaddr.to_pgtbl_idx::<1>();
         Self::alloc_pte_lvl1(&mut page[idx], vaddr, size, parent_flags)
     }
@@ -398,6 +405,10 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
 
         entry.set(A::make_private_address(paddr), parent_flags);
 
+        // SAFETY: `page` was freshly allocated by `alloc` and just installed
+        // into `entry`; it is exclusively owned here and not yet reachable by
+        // any other thread.
+        let page = unsafe { &mut *page };
         let idx = vaddr.to_pgtbl_idx::<0>();
         Mapping::new(PageLevel::Level0, &mut page[idx])
     }
@@ -461,7 +472,7 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
     /// # Returns
     /// A result containing the newly allocated page table page, or an error
     /// [`PagingError`] in failure.
-    fn do_split_4k(entry: &mut PTEntry<A>) -> Result<&'static mut PTPage<A, P>, PagingError> {
+    fn do_split_4k(entry: &mut PTEntry<A>) -> Result<&'_ mut PTPage<A, P>, PagingError> {
         let (page, paddr) = PTPage::<A, P>::alloc()?;
         let mut flags = entry.flags();
 
@@ -471,7 +482,11 @@ impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
 
         flags.remove(A::PTFlags::HUGE);
 
-        // Prepare PTE leaf page
+        // Populate the leaf page before installing it, so the entry flips
+        // atomically from a huge page to a fully-populated table.
+        // SAFETY: `page` is a freshly allocated, zeroed page that is exclusively
+        // owned here and not yet reachable through any entry or other thread.
+        let page = unsafe { &mut *page };
         for (i, e) in page.entries.iter_mut().enumerate() {
             let addr_4k = addr_2m + (i * PAGE_SIZE);
             e.clear();
