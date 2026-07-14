@@ -25,7 +25,7 @@ use core::ptr::NonNull;
 use cpuarch::x86::CR0Flags;
 use cpuarch::x86::CR4Flags;
 use cpuarch::x86::EFERFlags;
-use paging::pagetable::{
+use paging::ptpage::{
     ArchPagingMeta, GenericPageTable, PageLevel, PagingError, PagingHandler, SelfMap,
 };
 use paging::tlb::MayNeedFlush;
@@ -243,16 +243,16 @@ impl PagingMode {
 }
 
 /// Represents a page table entry.
-pub type PTEntry = paging::pagetable::PTEntry<SvsmPaging>;
+pub type PTEntry = paging::ptpage::PTEntry<SvsmPaging>;
 
 /// A pagetable page with multiple entries.
-pub type PTPage = paging::pagetable::PTPage<SvsmPaging, SvsmPaging>;
+pub type PTPage = paging::ptpage::PTPage<SvsmPaging, SvsmPaging>;
 
 /// Mapping levels of page table entries.
-pub type Mapping<'a> = paging::pagetable::Mapping<'a, SvsmPaging>;
+pub type Mapping<'a> = paging::ptpage::Mapping<'a, SvsmPaging>;
 
 /// A physical address within a page frame
-pub type PageFrame = paging::pagetable::PageFrame<SvsmPaging>;
+pub type PageFrame = paging::ptpage::PageFrame<SvsmPaging>;
 
 pub type SvsmMayNeedFlush = MayNeedFlush<SvsmPaging>;
 
