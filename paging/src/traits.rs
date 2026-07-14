@@ -4,7 +4,7 @@
 
 use crate::{
     address::{Address, PhysAddr, VirtAddr},
-    pagetable::ENTRY_COUNT,
+    ptpage::ENTRY_COUNT,
     sizes::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M},
     tlb::TlbFlush,
 };
