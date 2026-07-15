@@ -32,7 +32,7 @@ use crate::locking::{
     WriteLockGuard, WriteLockGuardIrqSafe,
 };
 use crate::mm::page_visibility::SharedBox;
-use crate::mm::pagetable::{PTEntryFlags, PageTable, SvsmMayNeedFlush};
+use crate::mm::pagetable::{PTEntryFlags, PageTable, PopulatePagePart};
 use crate::mm::virtualrange::VirtualRange;
 use crate::mm::vm::{Mapping, VMKernelStack, VMPhysMem, VMR, VMRMapping, VMReserved};
 use crate::mm::{
@@ -679,7 +679,7 @@ impl PerCpu {
     /// Stores the page table root address.
     /// It requires that we never drop the `PageTable` after storing its root address.
     pub fn set_pgtable(&self, pgtable: ManuallyDrop<PageTable>) {
-        let vaddr = VirtAddr::from(pgtable.root_page());
+        let vaddr = pgtable.root_va();
         self.pgtbl
             .compare_exchange(0, vaddr.into(), Ordering::Relaxed, Ordering::Relaxed)
             .unwrap();
@@ -824,7 +824,7 @@ impl PerCpu {
 
     fn finish_page_table(&self) {
         let pgtable = self.get_pgtable();
-        self.vm_range.populate(pgtable).expect_no_flush();
+        self.vm_range.populate(pgtable);
     }
 
     pub fn dump_vm_ranges(&self) {
@@ -1201,8 +1201,8 @@ impl PerCpu {
     /// # Arguments
     ///
     /// * `pt` - The page table to populate the the PerCpu range into
-    pub fn populate_page_table(&self, pt: &mut PageTable) -> SvsmMayNeedFlush {
-        self.vm_range.populate(pt)
+    pub fn populate_page_table(&self, pt: &mut impl PopulatePagePart) {
+        self.vm_range.populate(pt);
     }
 
     pub fn handle_pf(&self, vaddr: VirtAddr, write: bool) -> Result<(), SvsmError> {

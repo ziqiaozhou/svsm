@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Generic page table types and structures for 4 KiB granule paging.
-//!
-//! They are designed for different OS or architectures.
-//!
-//! The implementation assumes a 4 KiB base page granule with a 4-level
-//! page table hierarchy (8-byte PTEntry and 512 entries per page), supporting three page
-//! sizes: 4 KiB, 2 MiB, and 1 GiB. This covers x86_64 (PML4) and
-//! ARM64 with 4 KiB granule. Other granule sizes (16 KiB, 64 KiB on
-//! ARM64) are not supported.
-
+//! Page table page and entry type for 4 KiB granule paging.
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::sizes::{PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
 pub use crate::traits::{
@@ -157,9 +148,8 @@ impl<A: ArchPagingMeta> PTEntry<A> {
     /// Volatile write of `e` through a raw entry pointer.
     ///
     /// # Safety
-    /// `entry` must be a valid, aligned pointer to a live [`PTEntry`]
-    /// (e.g. obtained from [`PTPage::entry_ptr`]).
-    pub unsafe fn write_pte(entry: *mut Self, e: Self) {
+    /// `entry` must be a valid, aligned pointer to a [`PTEntry`]
+    pub(crate) unsafe fn write_pte(entry: *mut Self, e: Self) {
         // SAFETY: as in `read_pte`.
         unsafe { entry.write_volatile(e) }
     }
@@ -266,14 +256,14 @@ impl<A: ArchPagingMeta, P: PagingHandler> IndexMut<usize> for PTPage<A, P> {
 
 /// Mapping of an inactive page table entry at a specific level.
 #[derive(Debug)]
-pub(crate) struct Mapping<'a, A: ArchPagingMeta> {
+pub struct Mapping<'a, A: ArchPagingMeta> {
     pub level: PageLevel,
     pub entry: &'a mut PTEntry<A>,
 }
 
 impl<'a, A: ArchPagingMeta> Mapping<'a, A> {
     /// Construct a `Mapping` at the given level.
-    fn new(level: PageLevel, entry: &'a mut PTEntry<A>) -> Self {
+    pub(crate) fn new(level: PageLevel, entry: &'a mut PTEntry<A>) -> Self {
         Self { level, entry }
     }
 }

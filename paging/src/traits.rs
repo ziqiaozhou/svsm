@@ -108,6 +108,8 @@ pub enum PagingError {
     AllocFrame,
     /// The requested virtual address is not mapped.
     NotMapped,
+    /// The page table entry is already present.
+    EntryAlreadyPresent,
 }
 
 /// Architecture-specific page table metadata for confidential computing.
