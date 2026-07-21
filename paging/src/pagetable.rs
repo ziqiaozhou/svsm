@@ -9,10 +9,13 @@
 //! sizes: 4 KiB, 2 MiB, and 1 GiB. This covers x86_64 (PML4) and
 //! ARM64 with 4 KiB granule. Other granule sizes (16 KiB, 64 KiB on
 //! ARM64) are not supported.
+use core::cmp::min;
 use core::marker::PhantomData;
 
 use crate::address::{Address, PhysAddr, VirtAddr};
-use crate::ptpage::{Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame, virt_from_lvl_idx};
+use crate::ptpage::{
+    ENTRY_COUNT, Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame, virt_from_lvl_idx,
+};
 use crate::sizes::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M};
 use crate::tlb::MayNeedFlush;
 use crate::traits::{
@@ -918,6 +921,65 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel + NextLevel, S: PageTab
             };
         }
         (all_mapped, flush)
+    }
+
+    /// Returns `true` if no entry in `page` (holding `level` entries) is present.
+    fn page_is_empty(page: *const PTPage<A, P>, level: PageLevel) -> bool {
+        (0..ENTRY_COUNT).all(|idx| !S::new_mapping_ref(level, page, idx).read().present())
+    }
+
+    fn free_pt_after_unmap(
+        page: *mut PTPage<A, P>,
+        level: PageLevel,
+        start_vaddr: VirtAddr,
+        end_vaddr: VirtAddr,
+    ) -> bool {
+        // Leaf entry representing mapped frame which should not be freed here.
+        if level.next_down().is_none() {
+            return Self::page_is_empty(page, level);
+        }
+        let start = Self::index_at(start_vaddr, level);
+        let end = Self::index_at(end_vaddr, level);
+        let mut next_start_vaddr = start_vaddr;
+        let next_level = level.next_down().unwrap();
+        let next_end_vaddr = (next_start_vaddr + next_level.size()).align_down(next_level.size());
+        let mut next_end_vaddr = min(next_end_vaddr, end_vaddr);
+        for index in start..=end {
+            let mut mapping = S::new_mapping_mut(None, level, page, index);
+            let entry = mapping.read();
+            if let Some(next) = PTPage::<A, P>::from_entry_raw(&entry) {
+                if Self::free_pt_after_unmap(
+                    next,
+                    level.next_down().unwrap(),
+                    next_start_vaddr,
+                    next_end_vaddr,
+                ) {
+                    mapping.staged().entry.clear();
+                    // SAFETY: We do not need flush the TLB,
+                    // since the old leaf mappings were non-present.
+                    unsafe {
+                        mapping.commit().ignore();
+                    }
+                    // SAFETY: the PT page is not reachable and can be safely deallocated.
+                    unsafe {
+                        P::deallocate_physical_page(entry.address());
+                    }
+                }
+                next_start_vaddr = next_end_vaddr;
+                next_end_vaddr = min(next_end_vaddr + next_level.size(), end_vaddr);
+            }
+        }
+        Self::page_is_empty(page, level)
+    }
+
+    /// Frees the page table pages that are no longer reachable after unmapping
+    pub fn free_page_table_by_range(&mut self, start_vaddr: VirtAddr, end_vaddr: VirtAddr) {
+        Self::free_pt_after_unmap(
+            self.root.as_mut_ptr(),
+            PagingLevel3::TOP_LEVEL,
+            start_vaddr,
+            end_vaddr,
+        );
     }
 }
 
