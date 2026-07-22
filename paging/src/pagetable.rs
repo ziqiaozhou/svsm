@@ -617,7 +617,7 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// still translates the same addresses. The caller who ultimately edits
     /// the split-out leaf is responsible for deciding whether that edit
     /// needs a flush, via the [`MayNeedFlush`] token it returns.
-    fn do_split_4k(entry: &mut PTEntry<A>) -> Result<(), PagingError> {
+    fn do_split_4k(entry: &mut PTEntry<A>) -> Result<&mut PTPage<A, P>, PagingError> {
         let (page, paddr) = PTPage::<A, P>::alloc()?;
         let mut flags = entry.flags();
 
@@ -636,23 +636,25 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
 
         entry.set(A::make_private_address(paddr), flags);
 
-        Ok(())
+        Ok(page)
     }
 
-    /// Splits a page into 4KB pages if it is part of a larger mapping.
+    /// Splits a page into 4KB pages for a specific virtual address.
     ///
     /// # Parameters
     /// - `mapping`: The mapping to split.
+    /// - `vaddr`: The virtual address for which to split the page.
     ///
     /// # Returns
-    /// A result indicating success or an error [`PagingError`].
-    fn split_4k(&mut self, vaddr: VirtAddr) -> Result<MayNeedFlush<A::TlbFlushTok>, PagingError> {
-        let mapping = self.walk_addr(vaddr);
+    /// A result containing the updated mapping for the virtual address, or an error
+    /// [`PagingError`] in failure.
+    fn split_4k(mapping: Mapping<'_, A>, vaddr: VirtAddr) -> Result<Mapping<'_, A>, PagingError> {
         match mapping.level {
-            PageLevel::Level0 => Ok(MayNeedFlush::none()),
+            PageLevel::Level0 => Ok(mapping),
             PageLevel::Level1 => {
-                Self::do_split_4k(mapping.entry)?;
-                Ok(MayNeedFlush::new(vaddr.align_down(PAGE_SIZE_2M), mapping.level))
+                let next = Self::do_split_4k(mapping.entry)?;
+                let idx = vaddr.to_pgtbl_idx::<0>();
+                Ok(Mapping::new(PageLevel::Level0, &mut next.entries[idx]))
             }
             _ => Err(PagingError::NotMapped),
         }
@@ -686,15 +688,29 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         &mut self,
         vaddr: VirtAddr,
     ) -> Result<MayNeedFlush<A::TlbFlushTok>, PagingError> {
-        let flush = self.split_4k(vaddr)?;
+        let mapping = self.walk_addr(vaddr);
+        let old_level = mapping.level;
+        let mut entry_copy = *mapping.entry;
+        let mapping_copy = Mapping::new(old_level, &mut entry_copy);
+        let mapping_4k = Self::split_4k(mapping_copy, vaddr)?;
 
         if let Mapping {
             level: PageLevel::Level0,
             entry,
-        } = self.walk_addr(vaddr)
+        } = mapping_4k
         {
             Self::make_pte_shared(entry);
-            Ok(MayNeedFlush::new(vaddr, PageLevel::Level0).and(flush))
+            mapping.entry.clear();
+            mapping.entry.set(entry_copy.address(), entry_copy.flags());
+            if old_level != PageLevel::Level0 {
+                // Splitting a huge page changes the translation's page size.
+                // A range INVLPG at huge granularity only invalidates the
+                // 2M base address and may leave stale 4K TLB entries within
+                // the split range, so flush the whole TLB to be safe.
+                Ok(MayNeedFlush::all())
+            } else {
+                Ok(MayNeedFlush::new(vaddr, old_level))
+            }
         } else {
             Err(PagingError::NotMapped)
         }
@@ -712,15 +728,29 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         &mut self,
         vaddr: VirtAddr,
     ) -> Result<MayNeedFlush<A::TlbFlushTok>, PagingError> {
-        let flush = self.split_4k(vaddr)?;
+        let mapping = self.walk_addr(vaddr);
+        let old_level = mapping.level;
+        let mut entry_copy = *mapping.entry;
+        let mapping_copy = Mapping::new(old_level, &mut entry_copy);
+        let mapping_4k = Self::split_4k(mapping_copy, vaddr)?;
 
         if let Mapping {
             level: PageLevel::Level0,
             entry,
-        } = self.walk_addr(vaddr)
+        } = mapping_4k
         {
             Self::make_pte_private(entry);
-            Ok(MayNeedFlush::new(vaddr, PageLevel::Level0).and(flush))
+            mapping.entry.clear();
+            mapping.entry.set(entry_copy.address(), entry_copy.flags());
+            if old_level != PageLevel::Level0 {
+                // Splitting a huge page changes the translation's page size.
+                // A range INVLPG at huge granularity only invalidates the
+                // 2M base address and may leave stale 4K TLB entries within
+                // the split range, so flush the whole TLB to be safe.
+                Ok(MayNeedFlush::all())
+            } else {
+                Ok(MayNeedFlush::new(vaddr, old_level))
+            }
         } else {
             Err(PagingError::NotMapped)
         }
