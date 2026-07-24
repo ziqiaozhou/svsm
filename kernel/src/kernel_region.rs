@@ -73,7 +73,7 @@ pub unsafe fn expand_kernel_heap(
         + PageTable::index::<3>(vaddr) * mem::size_of::<PTEntry>();
     // SAFETY: the launch info is trusted to provide a valid address for the
     // kernel paging root.
-    let pml4e = unsafe { PTEntry::read_pte(pml4e_vaddr) };
+    let pml4e = unsafe { PTEntry::read_pte(pml4e_vaddr.as_ptr()) };
 
     // Obtain the virtual address of the page that is described by the PML4E.
     // Because no global physical/virtual mappings have been established yet,

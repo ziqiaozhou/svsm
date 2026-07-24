@@ -352,7 +352,7 @@ pub struct Task {
     pub shadow_stack_base: VirtAddr,
 
     /// Page table that is loaded when the task is scheduled
-    pub page_table: SpinLock<PageBox<PageTable>>,
+    pub page_table: SpinLock<PageTable>,
 
     /// Task kernel stack mapping
     _kernel_stack: TaskKernelMapping,
@@ -437,6 +437,11 @@ impl Drop for Task {
         // but they are good sanity checks on the scheduler.
         debug_assert!(self.is_terminated() || self.is_pending());
         debug_assert!(irqs_enabled());
+        // Deallocate the page table associated with this task since
+        // SAFETY: this is safe since the task is inactive.
+        unsafe {
+            self.page_table.lock().dealloc();
+        }
     }
 }
 
@@ -551,7 +556,7 @@ impl Task {
             xsa,
             stack_bounds: bounds,
             shadow_stack_base,
-            page_table: SpinLock::new(pgtable),
+            page_table: SpinLock::new(pgtable.into()),
             _kernel_stack: kernel_stack_mapping,
             _shadow_stack: shadow_stack_mapping,
             mm: task_mm,
