@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Generic page table types and structures for 4 KiB granule paging.
+//! This module provides state-aware page table types for 4 KiB granule paging.
 //!
 //! They are designed for different OS or architectures.
 //!
@@ -9,334 +9,431 @@
 //! sizes: 4 KiB, 2 MiB, and 1 GiB. This covers x86_64 (PML4) and
 //! ARM64 with 4 KiB granule. Other granule sizes (16 KiB, 64 KiB on
 //! ARM64) are not supported.
+use core::cmp::min;
+use core::marker::PhantomData;
 
 use crate::address::{Address, PhysAddr, VirtAddr};
-use crate::sizes::{PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M, PageSize};
-pub use crate::tlb::MayNeedFlush;
-pub use crate::traits::{
-    ArchPagingMeta, GenericPageTableFlags, PageLevel, PagingError, PagingHandler, PagingLevel,
-    PagingLevel2, PagingLevel3, SelfMap,
+use crate::ptpage::{
+    ENTRY_COUNT, Mapping, PTE_SHIFT, PTEntry, PTPage, PageFrame, virt_from_lvl_idx,
 };
-use bitflags::Flags;
-use core::marker::PhantomData;
-use core::ops::{Index, IndexMut};
-use zerocopy::{FromBytes, FromZeros};
+use crate::sizes::{PAGE_SIZE, PAGE_SIZE_1G, PAGE_SIZE_2M};
+use crate::tlb::MayNeedFlush;
+use crate::traits::{
+    ArchPagingMeta, GenericPageTableFlags, NextLevel, PageLevel, PagingError, PagingHandler,
+    PagingLevel, PagingLevel3, SelfMap,
+};
 
-/// Number of virtual-address bits indexed by a single page-table level.
-/// Assume 8-byte page table entries and page granularity = 1 << PAGE_SHIFT
-pub(crate) const PTE_SHIFT: usize = PAGE_SHIFT - 3;
+/// Read-only *behavior* of a state-aware page table entry mapping handle.
+pub trait MappingRefOps<'a, A>: Sized
+where
+    A: ArchPagingMeta,
+{
+    /// The level at which the entry terminated.
+    fn level(&self) -> PageLevel;
 
-/// Number of entries in a page table (4KB/8B).
-pub(crate) const ENTRY_COUNT: usize = 1 << PTE_SHIFT;
-
-const fn virt_from_lvl_idx(idx: usize, level: PageLevel) -> VirtAddr {
-    VirtAddr::new(idx << ((level as usize * PTE_SHIFT) + PAGE_SHIFT))
+    /// Read the entry (volatile for installed, plain for inactive).
+    fn read(&self) -> PTEntry<A>;
 }
 
-const _: () = assert!(
-    core::mem::size_of::<PhysAddr>() == 8,
-    "Only supports 8 bytes PTE entry",
-);
+/// Read + commit *behavior* of a state-aware mutable mapping handle.
+pub trait MappingMutOps<'a, A>: Sized
+where
+    A: ArchPagingMeta,
+{
+    /// The level at which the mapping terminated.
+    fn level(&self) -> PageLevel;
 
-/// Represents a page table entry.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, FromBytes)]
-pub struct PTEntry<A: ArchPagingMeta> {
-    entry: PhysAddr,
-    _phantom: PhantomData<A>,
+    /// Read the entry (volatile for installed, plain for inactive).
+    fn read(&self) -> PTEntry<A>;
+
+    /// A scratch [`Mapping`] the `do_*` helpers edit before committing.
+    fn staged(&mut self) -> Mapping<'_, A>;
+
+    /// Commit the staged entry, returning any TLB-flush obligation.
+    fn commit(self) -> MayNeedFlush<A::TlbFlushTok>;
+
+    /// Commit an entry for which **no TLB flush is owed**: either the previous
+    /// entry was non-present (installed) or the table is not installed.
+    fn commit_no_flush<F, O>(self, update: F) -> Result<O, PagingError>
+    where
+        F: FnOnce(Mapping<'_, A>) -> Result<O, PagingError>;
 }
 
-impl<A: ArchPagingMeta> PTEntry<A> {
-    /// Check if the page table entry is clear (null).
-    pub fn is_clear(&self) -> bool {
-        self.entry.is_null()
-    }
-
-    /// Clear the page table entry.
-    pub fn clear(&mut self) {
-        self.entry = PhysAddr::null();
-    }
-
-    /// Check if the page table entry is present.
-    pub fn present(&self) -> bool {
-        self.flags().present()
-    }
-
-    /// Check if the page table entry is huge.
-    pub fn huge(&self) -> bool {
-        self.flags().huge()
-    }
-
-    /// Check if the page table entry is user-accessible.
-    pub fn user(&self) -> bool {
-        self.flags().user()
-    }
-
-    /// Get the raw bits (`usize`) of the page table entry.
-    pub fn raw(&self) -> usize {
-        self.entry.bits()
-    }
-
-    /// Get the flags of the page table entry.
-    pub fn flags(&self) -> A::PTFlags {
-        A::PTFlags::from_bits_truncate(self.entry.bits())
-    }
-
-    /// Set the page table entry with the specified address and flags.
-    pub fn set_unrestricted(&mut self, addr: PhysAddr, flags: A::PTFlags) {
-        let addr = addr.bits();
-        assert_eq!(addr & !A::address_mask(), 0);
-        self.entry = PhysAddr::from(addr | flags.bits());
-    }
-
-    /// Set the page table entry with the specified address, with flags
-    /// constrained to the supported feature flags.
-    pub fn set(&mut self, addr: PhysAddr, flags: A::PTFlags) {
-        self.set_unrestricted(addr, flags & A::supported_flags());
-    }
-
-    /// Inserts the private address mask if the page is present.
-    pub fn make_private_if_present(&mut self) {
-        if self.flags().contains(A::PTFlags::PRESENT) {
-            self.entry = A::make_private_address(self.entry);
-        }
-    }
-
-    /// Get the paddr field from the entry.
-    ///
-    /// Returns bits `[51:12]` of the entry — the address *including* any
-    /// encryption/confidentiality bits the hardware stores in the upper
-    /// physical address bits.
-    pub fn paddr_field(&self) -> PhysAddr {
-        PhysAddr::from(self.raw() & A::address_mask())
-    }
-
-    /// Get the address from the page table entry, including the shared bit.
-    pub fn page_frame(&self) -> PhysAddr {
-        A::strip_confidentiality_bits(self.paddr_field())
-    }
-
-    /// Get the address from the page table entry, excluding the C/shared bit.
-    pub fn address(&self) -> PhysAddr {
-        A::strip_shared_address_bits(self.page_frame())
-    }
-
-    // Returns true if the address is shared.
-    pub fn is_shared(&self) -> bool {
-        A::is_shared_address(self.paddr_field())
-    }
-
-    /// Read a page table entry from the specified virtual address.
-    ///
-    /// # Safety
-    ///
-    /// Reads from an arbitrary virtual address, making this essentially a
-    /// raw pointer read.  The caller must be certain to calculate the correct
-    /// address.
-    pub unsafe fn read_pte(vaddr: VirtAddr) -> Self {
-        // SAFETY: When the methods safety requirements are met, the raw
-        // pointer read is safe.
-        unsafe { *vaddr.as_ptr::<Self>() }
-    }
-}
-
-/// A pagetable page with multiple entries.
-#[repr(C)]
-#[derive(Debug, FromBytes)]
-pub struct PTPage<A: ArchPagingMeta, P: PagingHandler> {
-    pub entries: [PTEntry<A>; ENTRY_COUNT],
-    _phantom: PhantomData<P>,
-}
-
-impl<A: ArchPagingMeta, P: PagingHandler> PTPage<A, P> {
-    /// Allocates a zeroed pagetable page and returns a mutable reference to
-    /// it, plus its physical address.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PagingError`] if the page cannot be allocated.
-    fn alloc() -> Result<(&'static mut Self, PhysAddr), PagingError> {
-        let paddr = P::allocate_physical_page()?;
-        let vaddr = P::paddr_to_vaddr(paddr);
-        // SAFETY: allocate_physical_page returns a unique, zeroed frame and
-        // paddr_to_vaddr returns a valid virtual mapping for it.
-        let page = unsafe { Self::from_vaddr(vaddr) };
-        Ok((page, paddr))
-    }
-
-    /// Converts a pagetable entry to a mutable reference to a [`PTPage`],
-    /// if the entry is present and not huge.
-    pub fn from_entry(entry: PTEntry<A>) -> Option<&'static mut Self> {
-        if !entry.present() || entry.huge() {
-            return None;
-        }
-
-        let address = P::paddr_to_vaddr(entry.address());
-        // SAFETY: Every PTEntry points to a previously allocated page-table
-        // page, so this pointer dereference is safe.
-        Some(unsafe { Self::from_vaddr(address) })
-    }
-
-    /// Generates a `PTPage` from a virtual address.
-    /// # Safety
-    /// The caller must ensure that the virtual address is a valid page table.
-    pub unsafe fn from_vaddr(vaddr: VirtAddr) -> &'static mut Self {
-        // SAFETY: the caller guarantees the correctness of the virtual
-        // address.
-        unsafe { &mut *vaddr.as_mut_ptr::<Self>() }
-    }
-}
-
-/// Can be used to access page table entries by index.
-impl<A: ArchPagingMeta, P: PagingHandler> Index<usize> for PTPage<A, P> {
-    type Output = PTEntry<A>;
-
-    fn index(&self, index: usize) -> &PTEntry<A> {
-        &self.entries[index]
-    }
-}
-
-/// Can be used to modify page table entries by index.
-impl<A: ArchPagingMeta, P: PagingHandler> IndexMut<usize> for PTPage<A, P> {
-    fn index_mut(&mut self, index: usize) -> &mut PTEntry<A> {
-        &mut self.entries[index]
-    }
-}
-
-/// Mapping levels of page table entries.
-#[derive(Debug)]
-pub struct Mapping<'a, P: ArchPagingMeta> {
-    pub level: PageLevel,
-    pub entry: &'a mut PTEntry<P>,
-}
-
-impl<'a, P: ArchPagingMeta> Mapping<'a, P> {
-    /// Construct a `Mapping` at the given level.
-    pub fn new(level: PageLevel, entry: &'a mut PTEntry<P>) -> Self {
-        Self { level, entry }
-    }
-}
-
-/// A physical address within a page frame
-#[derive(Clone, Copy, Debug)]
-pub enum PageFrame<A: ArchPagingMeta> {
-    Size4K(PhysAddr),
-    Size2M(PhysAddr),
-    Size1G(PhysAddr, PhantomData<A>),
-}
-
-impl<A: ArchPagingMeta> PageFrame<A> {
-    /// Get the address from the page frame, including the shared bit.
-    pub fn page_frame(&self) -> PhysAddr {
-        let paddr = match *self {
-            Self::Size4K(pa) => pa,
-            Self::Size2M(pa) => pa,
-            Self::Size1G(pa, _) => pa,
-        };
-        // Redundant but explicit.
-        A::strip_confidentiality_bits(paddr)
-    }
-
-    /// Get the address from the page frame, excluding the C/shared bit.
-    pub fn address(&self) -> PhysAddr {
-        A::strip_shared_address_bits(self.page_frame())
-    }
-
-    pub fn size(&self) -> usize {
-        match self {
-            Self::Size4K(_) => PAGE_SIZE,
-            Self::Size2M(_) => PAGE_SIZE_2M,
-            Self::Size1G(_, _) => PAGE_SIZE_1G,
-        }
-    }
-
-    pub fn start(&self) -> PhysAddr {
-        let end = self.address().bits() & !(self.size() - 1);
-        end.into()
-    }
-
-    pub fn end(&self) -> PhysAddr {
-        self.start() + self.size()
-    }
-}
-
-/// A page table hierarchy rooted at `L::TOP_LEVEL`.
+/// Mutable mapping handle for an **installed** table.
 ///
-/// The root is a concrete page-table page (`PTPage`) whose level is described
+/// Its constructor is private to this module; it is only produced by a
+/// writable walk.
+#[derive(Debug)]
+pub struct InstalledMapping<'a, A: ArchPagingMeta> {
+    vaddr: Option<VirtAddr>,
+    level: PageLevel,
+    entry: *mut PTEntry<A>,
+    staged: Option<PTEntry<A>>,
+    _lifetime: PhantomData<&'a mut PTEntry<A>>,
+}
+
+impl<'a, A: ArchPagingMeta> MappingMutOps<'a, A> for InstalledMapping<'a, A> {
+    fn level(&self) -> PageLevel {
+        self.level
+    }
+
+    fn read(&self) -> PTEntry<A> {
+        // SAFETY: `entry` points at a valid PTEntry; installed reads are volatile.
+        unsafe { PTEntry::read_pte(self.entry) }
+    }
+
+    fn staged(&mut self) -> Mapping<'_, A> {
+        let entry = self.entry;
+        let staged = self.staged.get_or_insert_with(||
+            // SAFETY: `entry` points at a valid PTEntry; installed reads are
+            // volatile. First stage seeds the buffer from the live entry.
+            unsafe { PTEntry::read_pte(entry) });
+        Mapping::new(self.level, staged)
+    }
+
+    fn commit(self) -> MayNeedFlush<A::TlbFlushTok> {
+        if let Some(staged) = self.staged {
+            // SAFETY: `entry` points at a valid live PTEntry; installed writes are volatile.
+            unsafe { PTEntry::write_pte(self.entry, staged) };
+        }
+        match self.vaddr {
+            Some(vaddr) => MayNeedFlush::new(vaddr, self.level),
+            None => MayNeedFlush::all(),
+        }
+    }
+
+    fn commit_no_flush<F, O>(mut self, update: F) -> Result<O, PagingError>
+    where
+        F: FnOnce(Mapping<'_, A>) -> Result<O, PagingError>,
+    {
+        let staged = self.staged();
+        if staged.entry.present() {
+            return Err(PagingError::EntryAlreadyPresent);
+        }
+        let ret = update(staged)?;
+        // SAFETY: InstalledMapping guarantees `entry` points at a valid PTE.
+        unsafe { PTEntry::write_pte(self.entry, *self.staged().entry) };
+        Ok(ret)
+    }
+}
+
+/// Read-only mapping handle for an **installed** table.
+///
+/// Its constructor is private to this module; it is only produced by a
+/// read-only walk. The lifetime `'a` is bounded by the table's lifetime. Only
+/// `A` is stored; `P` is a `new`-only generic used to interpret the incoming
+/// `*const PTPage<A, P>`.
+#[derive(Debug)]
+pub struct InstalledMappingRef<'a, A: ArchPagingMeta> {
+    level: PageLevel,
+    entry: *const PTEntry<A>,
+    _lifetime: PhantomData<&'a PTEntry<A>>,
+}
+
+impl<'a, A: ArchPagingMeta> MappingRefOps<'a, A> for InstalledMappingRef<'a, A> {
+    fn level(&self) -> PageLevel {
+        self.level
+    }
+
+    fn read(&self) -> PTEntry<A> {
+        // SAFETY: `entry` points at a valid PTEntry; installed reads are volatile.
+        unsafe { PTEntry::read_pte(self.entry) }
+    }
+}
+
+/// Read-only mapping handle for an **inactive** table: a plain shared borrow.
+#[derive(Debug)]
+pub struct InactiveMappingRef<'a, A: ArchPagingMeta, P: PagingHandler> {
+    level: PageLevel,
+    entry: &'a PTEntry<A>,
+    _handler: PhantomData<P>,
+}
+
+impl<'a, A: ArchPagingMeta, P: PagingHandler> MappingRefOps<'a, A>
+    for InactiveMappingRef<'a, A, P>
+{
+    fn level(&self) -> PageLevel {
+        self.level
+    }
+
+    fn read(&self) -> PTEntry<A> {
+        *self.entry
+    }
+}
+
+impl<'a, A: ArchPagingMeta> MappingMutOps<'a, A> for Mapping<'a, A> {
+    fn level(&self) -> PageLevel {
+        self.level
+    }
+
+    fn read(&self) -> PTEntry<A> {
+        *self.entry
+    }
+
+    fn staged(&mut self) -> Mapping<'_, A> {
+        Mapping::new(self.level, self.entry)
+    }
+
+    fn commit(self) -> MayNeedFlush<A::TlbFlushTok> {
+        MayNeedFlush::none()
+    }
+
+    fn commit_no_flush<F, O>(self, update: F) -> Result<O, PagingError>
+    where
+        F: FnOnce(Mapping<'_, A>) -> Result<O, PagingError>,
+    {
+        let ret = update(self)?;
+        Ok(ret)
+    }
+}
+
+/// Per-state associated types. Parameterized over the arch `A` and handler `P`
+/// so the associated items only carry a lifetime, keeping every `S::…`
+/// reference free of `A`/`P` turbofish.
+pub trait PageTableTypesByState<A: ArchPagingMeta, P: PagingHandler> {
+    /// TLB-flush obligation of this state's mutable commit
+    /// (Installed: `MayNeedFlush<A::TlbFlushTok>`, Inactive: `()`).
+    type Flush;
+
+    /// Read handle type (behavior only; construction is via `new_mapping_ref`).
+    type MappingRef<'a>: MappingRefOps<'a, A>;
+
+    /// Mutable handle type; the `Flush` equality bound ties
+    /// `MappingMutOpMayNeedFlush<A::TlbFlushTok>` to `Self::Flush`.
+    type MappingMut<'a>: MappingMutOps<'a, A>;
+}
+
+/// The state-specific construction + descent primitives. This trait is
+/// **sealed**: its supertrait [`PageTableState`] can only be implemented inside
+/// this crate (via the private `SealedState`), so external crates may name it
+/// as a bound but never implement it.
+pub trait PageTableStateSealed<A: ArchPagingMeta, P: PagingHandler>:
+    PageTableState + PageTableTypesByState<A, P>
+{
+    /// Construct a read handle to entry `index` of `page` at `level`.
+    ///
+    /// `page` must point at a valid page-table page owned by the table; each
+    /// state wraps the resulting entry pointer as its own read handle (raw for
+    /// installed, a bounded `&PTEntry` for inactive).
+    fn new_mapping_ref<'a>(
+        level: PageLevel,
+        page: *const PTPage<A, P>,
+        index: usize,
+    ) -> Self::MappingRef<'a>;
+
+    /// Construct a mutable handle to entry `index` of `page` at `level`.
+    ///
+    /// `page` must point at a valid page-table page owned by the table.
+    fn new_mapping_mut<'a>(
+        vaddr: Option<VirtAddr>,
+        level: PageLevel,
+        page: *mut PTPage<A, P>,
+        index: usize,
+    ) -> Self::MappingMut<'a>;
+
+    /// Descend to the read child page of `entry` (present, non-huge).
+    fn child(entry: &PTEntry<A>) -> Option<*const PTPage<A, P>> {
+        PTPage::<A, P>::from_entry_raw(entry).map(|p| p.cast_const())
+    }
+
+    /// Descend to the mutable child page of `entry` (present, non-huge).
+    fn child_mut(entry: &PTEntry<A>) -> Option<*mut PTPage<A, P>> {
+        PTPage::<A, P>::from_entry_raw(entry)
+    }
+}
+
+/// Private, non-generic seal for the public [`PageTableState`] marker.
+trait SealedState {}
+impl SealedState for Installed {}
+impl SealedState for Inactive {}
+/// Marker trait for the lifecycle state of a [`GenericPageTable`].
+///
+/// A table is either [`Installed`] (may be live in `CR3` on some CPU, so its
+/// entries must only be touched through volatile accessors) or [`Inactive`]
+/// (not reachable by any MMU walker, so plain `&mut PTPage` access is sound).
+#[allow(private_bounds)]
+pub trait PageTableState: SealedState {
+    const IS_INSTALLED: bool = true;
+}
+
+/// The table may be installed in `CR3`; entries are accessed volatile-only.
+#[derive(Debug)]
+pub struct Installed;
+impl PageTableState for Installed {
+    const IS_INSTALLED: bool = true;
+}
+
+impl<A: ArchPagingMeta, P: PagingHandler> PageTableTypesByState<A, P> for Installed {
+    type Flush = MayNeedFlush<A::TlbFlushTok>;
+    type MappingRef<'a> = InstalledMappingRef<'a, A>;
+    type MappingMut<'a> = InstalledMapping<'a, A>;
+}
+
+impl<A: ArchPagingMeta, P: PagingHandler> PageTableStateSealed<A, P> for Installed {
+    fn new_mapping_ref<'a>(
+        level: PageLevel,
+        page: *const PTPage<A, P>,
+        index: usize,
+    ) -> Self::MappingRef<'a> {
+        InstalledMappingRef {
+            level,
+            entry: PTPage::<A, P>::entry_ptr(page, index),
+            _lifetime: PhantomData,
+        }
+    }
+
+    fn new_mapping_mut<'a>(
+        vaddr: Option<VirtAddr>,
+        level: PageLevel,
+        page: *mut PTPage<A, P>,
+        index: usize,
+    ) -> Self::MappingMut<'a> {
+        InstalledMapping {
+            vaddr,
+            level,
+            entry: PTPage::<A, P>::entry_ptr(page, index) as _,
+            staged: None,
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+/// The table is not reachable by any MMU walker and may be edited directly.
+#[derive(Debug)]
+pub struct Inactive;
+
+impl PageTableState for Inactive {
+    const IS_INSTALLED: bool = false;
+}
+
+impl<A: ArchPagingMeta, P: PagingHandler> PageTableTypesByState<A, P> for Inactive {
+    type Flush = ();
+    type MappingRef<'a> = InactiveMappingRef<'a, A, P>;
+    type MappingMut<'a> = Mapping<'a, A>;
+}
+
+impl<A: ArchPagingMeta, P: PagingHandler> PageTableStateSealed<A, P> for Inactive {
+    fn new_mapping_ref<'a>(
+        level: PageLevel,
+        page: *const PTPage<A, P>,
+        index: usize,
+    ) -> Self::MappingRef<'a> {
+        let entry = PTPage::<A, P>::entry_ptr(page, index);
+        InactiveMappingRef {
+            level,
+            // SAFETY: `page` is a valid inactive page-table page and
+            // `index < ENTRY_COUNT`, so `entry` points at a live `PTEntry` that
+            // no MMU walker can alias while the table is inactive.
+            entry: unsafe { &*entry },
+            _handler: PhantomData,
+        }
+    }
+
+    fn new_mapping_mut<'a>(
+        _vaddr: Option<VirtAddr>,
+        level: PageLevel,
+        page: *mut PTPage<A, P>,
+        index: usize,
+    ) -> Self::MappingMut<'a> {
+        let entry = PTPage::<A, P>::entry_ptr(page, index).cast_mut();
+        // SAFETY: `page` is a valid inactive page-table page and
+        // `index < ENTRY_COUNT`, so `entry` points at a live `PTEntry` uniquely
+        // owned by this handle while the table is inactive.
+        Mapping::new(level, unsafe { &mut *entry })
+    }
+}
+
+/// An abstract type representing a page table at level `L`.
+///
+/// The root represents a concrete page-table node whose level is described
 /// by `L`. This can represent either a complete top-level page table, such as
 /// a PML4-rooted table, or a lower-level subtree, such as a PDPT-rooted table
 /// that is installed into a top-level page table.
 ///
-/// Ownership and synchronization are left to the OS-specific code.
+/// The ownership of top-level page is held by the `GenericPageTable`.
+///
+/// Ownership of lower-level subtrees are left to the OS-specific code.
 /// If a lower-level subtree is shared between multiple top-level page tables,
 /// all users of that subtree must coordinate updates to avoid concurrent
 /// modifications to the same page-table entries.
-#[repr(C)]
-#[derive(Debug, FromZeros)]
-pub struct GenericPageTable<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> {
-    root: PTPage<A, P>,
-    _level: PhantomData<L>,
+///
+/// We use state type parameters to track the state of page table, indicating
+/// whether it is installed in a CPU or not. We rely on a conservative transition rule:
+///
+/// 1. The transition from inactive to installed is always safe since the operation
+///    on an installed page table is still valid on an inactive page table. A clear
+///    transition point is when we first load the table into cr3 in one CPU.
+///
+/// 2. The transition from installed to inactive is always unsafe since we never
+///    track the cr3 values across different CPUs. In practice, this is difficult
+///    since page table switch may happen in assembly code and thus it is not
+///    possible to provide a single trusted function to track cr3 values. Thus,
+///    we left it to the developer to decide when it is safe to use an installed
+///    table as inactive.
+///
+/// For InstalledPageTable, there are several requirements:
+/// a. compiler should not optimize the write even if no read happens after the write.
+/// b. compiler should not optimize the read even if no write happens since the OS may
+///    need to track A/D bits.
+/// c. software should not observe torn writes, when MMU may update the entry (A/D bits)
+///
+/// All requirements can be satisfied if page table entries are accessed via
+/// 64-bit volatile read and write.
+///
+/// Why AtomicUsize is not necessary?
+/// a. Page table rely on Lock to ensure concurrent software accesses are safe
+///    and synced and so it should not encounter relaxed order issue.
+/// b. 64-bit aligned volatile access on 64 bits is atomic in x86_64 and Arm.
+/// c. It is tolerable to lose some A/D bit updates by MMU. For example,
+///    software read old -> hardware set A/D -> software update new = old | some_flag.
+///
+/// For InactivePageTable, we use normal memory accesses since it is not installed in any CPU.
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct GenericPageTable<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel, S: PageTableState>
+{
+    // store the inactive table here to prevent it from being used as inactive.
+    /// The root page table.
+    root: VirtAddr,
+    _level: PhantomData<(A, P, L, S)>,
 }
 
-/// Methods for page table hierarchies, independent of the self-map.
-impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P, L> {
-    /// Recursively free all page table pages starting from the root page.
-    fn free_lvl(page: &PTPage<A, P>, level: PageLevel) {
-        if level <= PageLevel::Level0 {
-            return;
-        }
-        for entry in page.entries.iter() {
-            if let Some(child) = PTPage::from_entry(*entry) {
-                if let Some(next) = level.next_down() {
-                    Self::free_lvl(child, next);
-                }
-                let paddr = entry.address();
-                // SAFETY: the page was allocated via PagingHandler::allocate_physical_page.
-                unsafe { P::deallocate_physical_page(paddr) };
-            }
-        }
+/// Stateless methods for managing a generic page table.
+impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel, S: PageTableState>
+    GenericPageTable<A, P, L, S>
+{
+    /// Allocate a new, zeroed root page table.
+    /// # Errors
+    /// Returns [`PagingError`] if the backing page cannot be allocated.
+    pub fn alloc() -> Result<Self, PagingError> {
+        let (page, _paddr) = PTPage::<A, P>::alloc()?;
+        Ok(Self {
+            root: page.into(),
+            _level: PhantomData,
+        })
     }
 
-    /// Free all page table pages starting from the root page.
-    /// We do not set it as a destructor because a page table may contain
-    /// shared sub-trees that may be in use by other root table.
-    ///
+    /// Physical address of the root page (state-independent).
+    pub fn root_pa(&self) -> PhysAddr {
+        P::vaddr_to_paddr(self.root)
+    }
+
+    /// Virtual address of the root page (state-independent).
+    pub fn root_vaddr(&self) -> VirtAddr {
+        self.root
+    }
+
+    /// Wrap the page table as installed or inactive one.
     /// # Safety
-    /// The caller must ensure that the page table is not in use by any other thread.
-    pub fn free(&self) {
-        Self::free_lvl(&self.root, L::TOP_LEVEL);
-    }
-
-    /// Get a copy of the entry at the specified index.
-    pub fn entry(&mut self, idx: usize) -> PTEntry<A> {
-        self.root.entries[idx]
-    }
-
-    /// Set the entry at the specified index.
-    ///
-    /// Returns `true` if the entry was updated, `false` otherwise.
-    pub fn set_entry(
-        &mut self,
-        idx: usize,
-        addr: PhysAddr,
-        flags: A::PTFlags,
-    ) -> (bool, MayNeedFlush<A::TlbFlushTok>) {
-        let old_entry = self.root.entries[idx];
-        self.root.entries[idx].set(addr, flags);
-        let updated = old_entry.raw() != self.root.entries[idx].raw();
-        let flush = if updated && old_entry.present() {
-            MayNeedFlush::all()
-        } else {
-            MayNeedFlush::none()
-        };
-        (updated, flush)
-    }
-
-    /// Copy an entry at `entry` from another `GenericPageTable`.
-    pub fn copy_entry(&mut self, other: &Self, idx: usize) {
-        let entry = &mut self.root.entries[idx];
-        assert!(!entry.present()); // No TLB flush needed
-        *entry = other.root.entries[idx];
+    /// The caller must guarantee that
+    /// 1. the root is a valid, page-aligned pointer
+    ///    to a root page-table page that remains valid for the lifetime of the implementor.
+    /// 2. the state of the page table is consistent with the type parameter `S` (i.e., either `Installed` or `Inactive`).
+    pub unsafe fn from_ptr(root_page: *mut PTPage<A, P>) -> Self {
+        Self {
+            root: root_page.into(),
+            _level: PhantomData,
+        }
     }
 
     /// Computes the index within a page table at the given level for a
@@ -347,425 +444,229 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     ///
     /// # Returns
     /// The index within the page table.
-    pub fn index<const LVL: usize>(vaddr: VirtAddr) -> usize {
+    pub const fn index<const LVL: usize>(vaddr: VirtAddr) -> usize {
         vaddr.to_pgtbl_idx::<LVL>()
     }
 
-    /// Walks a page table at level 0 to find a mapping.
+    /// Computes the index within a page table at a runtime `level` for a
+    /// virtual address `vaddr`.
     ///
     /// # Parameters
-    /// - `page`: A mutable reference to the root page table.
-    /// - `vaddr`: The virtual address to find a mapping for.
+    /// - `vaddr`: The virtual address to compute the index for.
+    /// - `level`: The page-table level to index into.
     ///
     /// # Returns
-    /// A `Mapping` representing the found mapping.
-    fn walk_addr_lvl0(page: &mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'_, A> {
-        let idx = vaddr.to_pgtbl_idx::<0>();
-        Mapping::new(PageLevel::Level0, &mut page[idx])
-    }
-
-    /// Walks a page table at level 1 to find a mapping.
-    ///
-    /// # Parameters
-    /// - `page`: A mutable reference to the root page table.
-    /// - `vaddr`: The virtual address to find a mapping for.
-    ///
-    /// # Returns
-    /// A `Mapping` representing the found mapping.
-    fn walk_addr_lvl1<'a>(page: &'a mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'a, A> {
-        let idx = vaddr.to_pgtbl_idx::<1>();
-        let entry = page[idx];
-        match PTPage::from_entry(entry) {
-            Some(next) => Self::walk_addr_lvl0(next, vaddr),
-            None => Mapping::new(PageLevel::Level1, &mut page[idx]),
-        }
-    }
-
-    /// Walks a page table at level 2 to find a mapping.
-    ///
-    /// # Parameters
-    /// - `page`: A mutable reference to the root page table.
-    /// - `vaddr`: The virtual address to find a mapping for.
-    ///
-    /// # Returns
-    /// A `Mapping` representing the found mapping.
-    fn walk_addr_lvl2<'a>(page: &'a mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'a, A> {
-        let idx = vaddr.to_pgtbl_idx::<2>();
-        let entry = page[idx];
-        match PTPage::from_entry(entry) {
-            Some(next) => Self::walk_addr_lvl1(next, vaddr),
-            None => Mapping::new(PageLevel::Level2, &mut page[idx]),
-        }
-    }
-
-    /// Walks the page table to find a mapping for a given virtual address.
-    ///
-    /// # Parameters
-    /// - `page`: A mutable reference to the root page table.
-    /// - `vaddr`: The virtual address to find a mapping for.
-    ///
-    /// # Returns
-    /// A `Mapping` representing the found mapping.
-    fn walk_addr_lvl3<'a>(page: &'a mut PTPage<A, P>, vaddr: VirtAddr) -> Mapping<'a, A> {
-        let idx = vaddr.to_pgtbl_idx::<3>();
-        let entry = page[idx];
-        match PTPage::from_entry(entry) {
-            Some(next) => Self::walk_addr_lvl2(next, vaddr),
-            None => Mapping::new(PageLevel::Level3, &mut page[idx]),
-        }
-    }
-
-    /// Walk the virtual address and return the corresponding mapping.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address to find a mapping for.
-    ///
-    /// # Returns
-    /// A `Mapping` representing the found mapping.
-    pub fn walk_addr(&mut self, vaddr: VirtAddr) -> Mapping<'_, A> {
-        match L::TOP_LEVEL {
-            PageLevel::Level3 => Self::walk_addr_lvl3(&mut self.root, vaddr),
-            PageLevel::Level2 => Self::walk_addr_lvl2(&mut self.root, vaddr),
-            _ => unreachable!(),
+    /// The index within the page table.
+    pub const fn index_at(vaddr: VirtAddr, level: PageLevel) -> usize {
+        match level {
+            PageLevel::Level0 => Self::index::<0>(vaddr),
+            PageLevel::Level1 => Self::index::<1>(vaddr),
+            PageLevel::Level2 => Self::index::<2>(vaddr),
+            PageLevel::Level3 => Self::index::<3>(vaddr),
         }
     }
 }
 
-/// Methods that use the self-map to inspect the *active* top-level page table.
-///
-/// Self-mapped address calculations assume a PML4-rooted table.
-impl<A: ArchPagingMeta, P: PagingHandler + SelfMap> GenericPageTable<A, P, PagingLevel3> {
-    /// Install the self-map entry in a freshly zeroed page table.
-    ///
-    /// `paddr` is the physical address of *this* page table's root page.
-    /// The self-map PML4 entry is written at [`SelfMap::SELFMAP_IDX`].
-    pub fn init_self_map(&mut self, paddr: PhysAddr) {
-        let entry = &mut self.root[P::SELFMAP_IDX];
-        let flags = A::PTFlags::self_map_table_flags();
-        entry.set(A::make_private_address(paddr), flags);
-    }
-
-    const fn pte_base_vaddr() -> VirtAddr {
-        virt_from_lvl_idx(P::SELFMAP_IDX, PagingLevel3::TOP_LEVEL)
-    }
-
-    /// Calculate the virtual address of a PTE in the self-map, which maps a
-    /// specified virtual address.
-    ///
-    /// # Parameters
-    /// - `vaddr': The virtual address whose PTE should be located.
-    ///
-    /// # Returns
-    /// The virtual address of the PTE.
-    fn get_pte_address(vaddr: VirtAddr) -> VirtAddr {
-        Self::pte_base_vaddr() + ((usize::from(vaddr) & 0x0000_FFFF_FFFF_F000) >> PTE_SHIFT)
-    }
-
-    /// Perform a virtual to physical translation using the self-map.
-    ///
-    /// # Parameters
-    /// - `vaddr': The virtual address to translate.
-    ///
-    /// # Returns
-    /// Some(PageFrame) if the virtual address is valid.
-    /// None if the virtual address is not valid.
-    pub fn virt_to_frame(vaddr: VirtAddr) -> Option<PageFrame<A>> {
-        let pte_addr = Self::get_pte_address(vaddr);
-        let pde_addr = Self::get_pte_address(pte_addr);
-        let pdpe_addr = Self::get_pte_address(pde_addr);
-        let pml4e_addr = Self::get_pte_address(pdpe_addr);
-
-        // SAFETY: Check each entry in the paging hierarchy to ensure it is
-        // safe to read the next entry.
-        let pml4e = unsafe { PTEntry::<A>::read_pte(pml4e_addr) };
-        if !pml4e.present() {
-            return None;
-        }
-
-        // There is no need to check for a large page in the PML4E because
-        // the architecture does not support the large bit at the top-level
-        // entry.  If a large page is detected at a lower level of the
-        // hierarchy, the low bits from the virtual address must be combined
-        // with the physical address from the PDE/PDPE.
-
-        // SAFETY: The PML4E was checked to be present, so the PDPE exists
-        // and can be read safely.
-        let pdpe = unsafe { PTEntry::<A>::read_pte(pdpe_addr) };
-        if !pdpe.present() {
-            return None;
-        }
-        if pdpe.huge() {
-            let pa = pdpe.page_frame() + (usize::from(vaddr) & 0x3FFF_FFFF);
-            return Some(PageFrame::Size1G(pa, PhantomData));
-        }
-
-        // SAFETY: The PDPE was checked to be present and not to be a huge
-        // page. So the PDE exists and can be read safely.
-        let pde = unsafe { PTEntry::<A>::read_pte(pde_addr) };
-        if !pde.present() {
-            return None;
-        }
-        if pde.huge() {
-            let pa = pde.page_frame() + (usize::from(vaddr) & 0x001F_FFFF);
-            return Some(PageFrame::Size2M(pa));
-        }
-
-        // SAFETY: The PDE was checked to be present and not to be a huge
-        // page. So the PTE exists and can be read safely.
-        let pte = unsafe { PTEntry::<A>::read_pte(pte_addr) };
-        if pte.present() {
-            let pa = pte.page_frame() + (usize::from(vaddr) & 0xFFF);
-            Some(PageFrame::Size4K(pa))
-        } else {
-            None
+impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel, S: PageTableState> Drop
+    for GenericPageTable<A, P, L, S>
+{
+    fn drop(&mut self) {
+        // Only free the root page for an inactive table. An installed table may
+        // still be reachable by the MMU, so we intentionally leak its root
+        // rather than free a page that hardware might still walk. Callers must
+        // transition the table to `Inactive` (via `as_inactive`) and tear it
+        // down explicitly to reclaim it.
+        if !S::IS_INSTALLED {
+            // SAFETY: GenericPageTable owns the root page, `root` was allocated by `alloc()`.
+            unsafe { P::deallocate_physical_page(self.root_pa()) };
         }
     }
 }
 
-impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P, L> {
-    /// Allocate from level 3 (PML4E) down to the target level.
-    fn alloc_pte_lvl3(entry: &mut PTEntry<A>, vaddr: VirtAddr, size: PageSize) -> Mapping<'_, A> {
-        if entry.flags().contains(A::PTFlags::PRESENT) {
-            return Mapping::new(PageLevel::Level3, entry);
+impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel + NextLevel, S: PageTableStateSealed<A, P>>
+    GenericPageTable<A, P, L, S>
+{
+    /// Get the physical address of the next level page table at the given index.
+    /// Returns None if the entry is not present or is a huge page.
+    pub fn next_table_pa(&self, idx: usize) -> Option<PhysAddr>
+    where
+        L: NextLevel,
+    {
+        let page = self.root.as_ptr();
+        let entry = S::new_mapping_ref(L::TOP_LEVEL, page, idx).read();
+        if !entry.present() || entry.huge() {
+            return None;
         }
-
-        let Ok((page, paddr)) = PTPage::<A, P>::alloc() else {
-            return Mapping::new(PageLevel::Level3, entry);
-        };
-
-        entry.set(A::make_private_address(paddr), A::PTFlags::parent_flags());
-
-        let idx = vaddr.to_pgtbl_idx::<2>();
-        Self::alloc_pte_lvl2(&mut page[idx], vaddr, size)
+        Some(entry.address())
     }
 
-    /// Allocate from level 2 (PDPTE) down to the target level.
-    fn alloc_pte_lvl2(entry: &mut PTEntry<A>, vaddr: VirtAddr, size: PageSize) -> Mapping<'_, A> {
-        if entry.flags().contains(A::PTFlags::PRESENT) {
-            return Mapping::new(PageLevel::Level2, entry);
+    /// Shared read walk for `vaddr` (one body for all states). Descends through
+    /// present, non-huge entries and stops at the leaf (`Level0`), at the first
+    /// absent entry, or at a huge entry. `page` is a raw pointer to the current
+    /// level's page; the next pointer comes from the read `entry`.
+    pub fn walk(&self, vaddr: VirtAddr) -> S::MappingRef<'_> {
+        let page: *const PTPage<A, P> = self.root.as_ptr();
+        let level = L::TOP_LEVEL;
+        let mut mapping = S::new_mapping_ref(level, page, Self::index_at(vaddr, level));
+        for _ in 0..L::TOP_LEVEL as usize {
+            let entry = mapping.read();
+            match PTPage::<A, P>::from_entry_raw(&entry) {
+                Some(next) => {
+                    let level = mapping
+                        .level()
+                        .next_down()
+                        .expect("non-leaf level has a child");
+                    mapping = S::new_mapping_ref(level, next, Self::index_at(vaddr, level));
+                }
+                None => {
+                    return mapping;
+                }
+            }
         }
-
-        let Ok((page, paddr)) = PTPage::<A, P>::alloc() else {
-            return Mapping::new(PageLevel::Level2, entry);
-        };
-
-        entry.set(A::make_private_address(paddr), A::PTFlags::parent_flags());
-
-        let idx = vaddr.to_pgtbl_idx::<1>();
-        Self::alloc_pte_lvl1(&mut page[idx], vaddr, size)
+        mapping
     }
 
-    /// Allocate from level 1 (PDE) down to level 0.
-    /// Returns at level 1 if `size` is `Huge` (2 MiB page).
-    fn alloc_pte_lvl1(entry: &mut PTEntry<A>, vaddr: VirtAddr, size: PageSize) -> Mapping<'_, A> {
-        let flags = entry.flags();
-        if size == PageSize::Huge || flags.contains(A::PTFlags::PRESENT) {
-            return Mapping::new(PageLevel::Level1, entry);
+    /// Shared mutable walk for `vaddr` (one body for all states), mirroring
+    /// [`walk`](Self::walk). `page` is a raw pointer to the current level's
+    /// page and the next pointer (`S::child_mut`) points at a disjoint child
+    /// page, so no two mutable entry handles ever alias.
+    pub fn walk_mut(&mut self, vaddr: VirtAddr) -> S::MappingMut<'_> {
+        let page: *mut PTPage<A, P> = self.root.as_mut_ptr();
+        let level = L::TOP_LEVEL;
+        let mut mapping =
+            S::new_mapping_mut(Some(vaddr), level, page, Self::index_at(vaddr, level));
+        for _ in 0..L::TOP_LEVEL as usize {
+            let entry = mapping.read();
+            match PTPage::<A, P>::from_entry_raw(&entry) {
+                Some(next) => {
+                    let level = mapping
+                        .level()
+                        .next_down()
+                        .expect("non-leaf level has a child");
+                    mapping =
+                        S::new_mapping_mut(Some(vaddr), level, next, Self::index_at(vaddr, level));
+                }
+                None => {
+                    return mapping;
+                }
+            }
         }
-
-        let Ok((page, paddr)) = PTPage::<A, P>::alloc() else {
-            return Mapping::new(PageLevel::Level1, entry);
-        };
-
-        entry.set(A::make_private_address(paddr), A::PTFlags::parent_flags());
-
-        let idx = vaddr.to_pgtbl_idx::<0>();
-        Mapping::new(PageLevel::Level0, &mut page[idx])
+        mapping
     }
 
-    /// Allocates a 4KB page table entry for a given virtual address.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address for which to allocate the PTE.
-    /// # Returns
-    /// A `Mapping` representing the allocated or existing PTE for the address.
-    fn alloc_pte_4k(&mut self, vaddr: VirtAddr) -> Mapping<'_, A> {
-        let m = self.walk_addr(vaddr);
-        match m.level {
-            PageLevel::Level0 => m,
-            PageLevel::Level1 => Self::alloc_pte_lvl1(m.entry, vaddr, PageSize::Regular),
-            PageLevel::Level2 => Self::alloc_pte_lvl2(m.entry, vaddr, PageSize::Regular),
-            PageLevel::Level3 => Self::alloc_pte_lvl3(m.entry, vaddr, PageSize::Regular),
-        }
-    }
-
-    /// Allocates a 2MB page table entry for a given virtual address.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address for which to allocate the PTE.
-    /// # Returns
-    /// A `Mapping` representing the allocated or existing PTE for the address.
-    fn alloc_pte_2m(&mut self, vaddr: VirtAddr) -> Mapping<'_, A> {
-        let m = self.walk_addr(vaddr);
-        match m.level {
-            PageLevel::Level0 | PageLevel::Level1 => m,
-            PageLevel::Level2 => Self::alloc_pte_lvl2(m.entry, vaddr, PageSize::Huge),
-            PageLevel::Level3 => Self::alloc_pte_lvl3(m.entry, vaddr, PageSize::Huge),
-        }
-    }
-
-    /// Splits a 2MB page into 4KB pages.
-    ///
-    /// # Parameters
-    /// - `entry`: The 2M page table entry to split.
+    /// Retrieves the physical address of a mapping.
     ///
     /// # Returns
-    /// A result indicating success or an error [`PagingError`] in failure.
-    ///
-    /// Does not flush the TLB itself: splitting only republishes the same
-    /// physical range through a new subtable, so the resulting `PTEntry`
-    /// still translates the same addresses. The caller who ultimately edits
-    /// the split-out leaf is responsible for deciding whether that edit
-    /// needs a flush, via the [`MayNeedFlush`] token it returns.
-    fn do_split_4k(entry: &mut PTEntry<A>) -> Result<&mut PTPage<A, P>, PagingError> {
-        let (page, paddr) = PTPage::<A, P>::alloc()?;
-        let mut flags = entry.flags();
-
-        assert!(flags.huge());
-
-        let addr_2m = PhysAddr::from(entry.address().bits() & 0x000f_ffff_fff0_0000);
-
-        flags.remove(A::PTFlags::HUGE);
-
-        // Prepare PTE leaf page
-        for (i, e) in page.entries.iter_mut().enumerate() {
-            let addr_4k = addr_2m + (i * PAGE_SIZE);
-            e.clear();
-            e.set(A::make_private_address(addr_4k), flags);
-        }
-
-        entry.set(A::make_private_address(paddr), flags);
-
-        Ok(page)
-    }
-
-    /// Splits a page into 4KB pages for a specific virtual address.
-    ///
-    /// # Parameters
-    /// - `mapping`: The mapping to split.
-    /// - `vaddr`: The virtual address for which to split the page.
-    ///
-    /// # Returns
-    /// A result containing the updated mapping for the virtual address, or an error
-    /// [`PagingError`] in failure.
-    fn split_4k(mapping: Mapping<'_, A>, vaddr: VirtAddr) -> Result<Mapping<'_, A>, PagingError> {
-        match mapping.level {
-            PageLevel::Level0 => Ok(mapping),
+    /// The physical address of the mapping if present; otherwise, an error
+    /// ([`PagingError`]).
+    pub fn translate(&self, vaddr: VirtAddr) -> Result<PageFrame<A>, PagingError> {
+        let mapping = self.walk(vaddr);
+        let entry = mapping.read();
+        match mapping.level() {
+            PageLevel::Level0 => {
+                let offset = vaddr.page_offset();
+                if !entry.present() {
+                    return Err(PagingError::NotMapped);
+                }
+                Ok(PageFrame::Size4K(entry.page_frame() + offset))
+            }
             PageLevel::Level1 => {
-                let next = Self::do_split_4k(mapping.entry)?;
-                let idx = vaddr.to_pgtbl_idx::<0>();
-                Ok(Mapping::new(PageLevel::Level0, &mut next.entries[idx]))
+                let offset = vaddr.bits() & (PAGE_SIZE_2M - 1);
+                if !entry.present() || !entry.huge() {
+                    return Err(PagingError::NotMapped);
+                }
+                Ok(PageFrame::Size2M(entry.page_frame() + offset))
+            }
+            PageLevel::Level2 => {
+                let offset = vaddr.bits() & (PAGE_SIZE_1G - 1);
+                if !entry.present() || !entry.huge() {
+                    return Err(PagingError::NotMapped);
+                }
+                Ok(PageFrame::Size1G(entry.page_frame() + offset, PhantomData))
             }
             _ => Err(PagingError::NotMapped),
         }
     }
 
-    fn make_pte_shared(entry: &mut PTEntry<A>) {
-        let flags = entry.flags();
-        let addr = entry.address();
-
-        // entry.address() returned with c-bit clear already
-        entry.set(A::make_shared_address(addr), flags);
+    pub fn phys_addr(&self, vaddr: VirtAddr) -> Result<PhysAddr, PagingError> {
+        self.translate(vaddr).map(|pf| pf.address())
     }
 
-    fn make_pte_private(entry: &mut PTEntry<A>) {
-        let flags = entry.flags();
-        let addr = entry.address();
-
-        // entry.address() returned with c-bit clear already
-        entry.set(A::make_private_address(addr), flags);
-    }
-
-    /// Sets the shared state for a 4KB page.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address of the page.
-    ///
-    /// # Returns
-    /// The [`MayNeedFlush`] TLB-flush obligation for the now-stale
-    /// translation on success, or a [`PagingError`] on failure.
-    pub fn set_shared_4k(
-        &mut self,
-        vaddr: VirtAddr,
-    ) -> Result<MayNeedFlush<A::TlbFlushTok>, PagingError> {
-        let mapping = self.walk_addr(vaddr);
-        let old_level = mapping.level;
-        let mut entry_copy = *mapping.entry;
-        let mapping_copy = Mapping::new(old_level, &mut entry_copy);
-        let mapping_4k = Self::split_4k(mapping_copy, vaddr)?;
-
-        if let Mapping {
-            level: PageLevel::Level0,
-            entry,
-        } = mapping_4k
-        {
-            Self::make_pte_shared(entry);
-            mapping.entry.clear();
-            mapping.entry.set(entry_copy.address(), entry_copy.flags());
-            if old_level != PageLevel::Level0 {
-                // Splitting a huge page changes the translation's page size.
-                // A range INVLPG at huge granularity only invalidates the
-                // 2M base address and may leave stale 4K TLB entries within
-                // the split range, so flush the whole TLB to be safe.
-                Ok(MayNeedFlush::all())
-            } else {
-                Ok(MayNeedFlush::new(vaddr, old_level))
-            }
-        } else {
-            Err(PagingError::NotMapped)
-        }
-    }
-
-    /// Sets the encryption state for a 4KB page.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address of the page.
-    ///
-    /// # Returns
-    /// The [`MayNeedFlush`] TLB-flush obligation for the now-stale
-    /// translation on success, or a [`PagingError`] on failure.
-    pub fn set_encrypted_4k(
-        &mut self,
-        vaddr: VirtAddr,
-    ) -> Result<MayNeedFlush<A::TlbFlushTok>, PagingError> {
-        let mapping = self.walk_addr(vaddr);
-        let old_level = mapping.level;
-        let mut entry_copy = *mapping.entry;
-        let mapping_copy = Mapping::new(old_level, &mut entry_copy);
-        let mapping_4k = Self::split_4k(mapping_copy, vaddr)?;
-
-        if let Mapping {
-            level: PageLevel::Level0,
-            entry,
-        } = mapping_4k
-        {
-            Self::make_pte_private(entry);
-            mapping.entry.clear();
-            mapping.entry.set(entry_copy.address(), entry_copy.flags());
-            if old_level != PageLevel::Level0 {
-                // Splitting a huge page changes the translation's page size.
-                // A range INVLPG at huge granularity only invalidates the
-                // 2M base address and may leave stale 4K TLB entries within
-                // the split range, so flush the whole TLB to be safe.
-                Ok(MayNeedFlush::all())
-            } else {
-                Ok(MayNeedFlush::new(vaddr, old_level))
-            }
-        } else {
-            Err(PagingError::NotMapped)
-        }
-    }
-
-    /// Maps a 2MB page.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address to map.
-    /// - `paddr`: The physical address to map to.
-    /// - `flags`: The flags to apply to the mapping.
-    /// - `shared`: Indicates whether the mapping is shared.
+    /// Maps a 4KB page, applying `parent_flags` to any allocated parent PTEs.
     ///
     /// # Returns
     /// A result indicating success or failure ([`PagingError`]).
+    pub fn map_4k_with_parent_flags(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: A::PTFlags,
+        shared: bool,
+        parent_flags: A::PTFlags,
+    ) -> Result<(), PagingError>
+    where
+        L: NextLevel,
+    {
+        let mapping = self.walk_mut(vaddr);
+        mapping.commit_no_flush(|m| {
+            PTPage::<A, P>::do_map_4k_with_parent_flags(
+                m,
+                vaddr,
+                paddr,
+                flags,
+                shared,
+                parent_flags,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Maps a 4KB page.
+    ///
+    /// # Returns
+    /// A result indicating success or failure ([`PagingError`]).
+    pub fn map_4k(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: A::PTFlags,
+        shared: bool,
+    ) -> Result<(), PagingError>
+    where
+        L: NextLevel,
+    {
+        self.map_4k_with_parent_flags(vaddr, paddr, flags, shared, A::PTFlags::parent_flags())
+    }
+
+    /// Maps a 2MB page, applying `parent_flags` to any allocated parent PTEs.
+    ///
+    /// # Panics
+    /// Panics if either `vaddr` or `paddr` is not aligned to a 2MB boundary.
+    pub fn map_2m_with_parent_flags(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: A::PTFlags,
+        shared: bool,
+        parent_flags: A::PTFlags,
+    ) -> Result<(), PagingError>
+    where
+        L: NextLevel,
+    {
+        self.walk_mut(vaddr).commit_no_flush(|m| {
+            PTPage::<A, P>::do_map_2m_with_parent_flags(
+                m,
+                vaddr,
+                paddr,
+                flags,
+                shared,
+                parent_flags,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Maps a 2MB page.
     ///
     /// # Panics
     /// Panics if either `vaddr` or `paddr` is not aligned to a 2MB boundary.
@@ -775,38 +676,31 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         paddr: PhysAddr,
         flags: A::PTFlags,
         shared: bool,
-    ) -> Result<(), PagingError> {
-        assert!(vaddr.is_aligned(PAGE_SIZE_2M));
-        assert!(paddr.is_aligned(PAGE_SIZE_2M));
-        let mapping = self.alloc_pte_2m(vaddr);
-        let addr = if !shared {
-            A::make_private_address(paddr)
-        } else {
-            A::make_shared_address(paddr)
-        };
+    ) -> Result<(), PagingError>
+    where
+        L: NextLevel,
+    {
+        self.map_2m_with_parent_flags(vaddr, paddr, flags, shared, A::PTFlags::parent_flags())
+    }
 
-        if let Mapping {
-            level: PageLevel::Level1,
-            entry,
-        } = mapping
-        {
-            assert!(!entry.present());
-            entry.set(addr, flags | A::PTFlags::HUGE);
-            Ok(())
-        } else {
-            Err(PagingError::AllocFrame)
-        }
+    /// Unmaps a 4KB page.
+    ///
+    /// # Returns
+    /// A copy of the entry that mapped the address before it was cleared (if a
+    /// leaf was present) together with the TLB-flush obligation.
+    pub fn unmap_4k(
+        &mut self,
+        vaddr: VirtAddr,
+    ) -> (Option<PTEntry<A>>, MayNeedFlush<A::TlbFlushTok>) {
+        let mut m = self.walk_mut(vaddr);
+        (PTPage::<A, P>::do_unmap_4k(m.staged()), m.commit())
     }
 
     /// Unmaps a 2MB page.
     ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address of the mapping to unmap.
-    ///
     /// # Returns
-    /// A copy of the [`PTEntry`] that mapped the virtual address together
-    /// with the [`MayNeedFlush`] TLB-flush obligation for the now-stale
-    /// translation, or [`None`] if no huge leaf was mapped.
+    /// A copy of the entry that mapped the address before it was cleared (if a
+    /// huge leaf was present) together with the TLB-flush obligation.
     ///
     /// # Panics
     /// Panics if `vaddr` is not aligned to a 2MB boundary.
@@ -814,88 +708,69 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         &mut self,
         vaddr: VirtAddr,
     ) -> (Option<PTEntry<A>>, MayNeedFlush<A::TlbFlushTok>) {
-        assert!(vaddr.is_aligned(PAGE_SIZE_2M));
-
-        let mapping = self.walk_addr(vaddr);
-
-        let level = mapping.level;
-        match mapping.level {
-            PageLevel::Level0 => unreachable!(),
-            PageLevel::Level1 => {
-                let entry = *mapping.entry;
-                mapping.entry.clear();
-                (Some(entry), MayNeedFlush::new(vaddr, level))
-            }
-            _ => {
-                assert!(!mapping.entry.present());
-                (None, MayNeedFlush::none())
-            }
-        }
+        let mut m = self.walk_mut(vaddr);
+        (PTPage::<A, P>::do_unmap_2m(m.staged()), m.commit())
     }
 
-    /// Maps a 4KB page.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address to map.
-    /// - `paddr`: The physical address to map to.
-    /// - `flags`: The flags to apply to the mapping.
-    /// - `shared`: Indicates whether the mapping is shared.
-    /// # Returns
-    /// A result indicating success or failure ([`PagingError`]).
-    pub fn map_4k(
-        &mut self,
-        vaddr: VirtAddr,
-        paddr: PhysAddr,
-        flags: A::PTFlags,
-        shared: bool,
-    ) -> Result<(), PagingError> {
-        let mapping = self.alloc_pte_4k(vaddr);
-        let addr = if !shared {
-            A::make_private_address(paddr)
-        } else {
-            A::make_shared_address(paddr)
-        };
-
-        if let Mapping {
-            level: PageLevel::Level0,
-            entry,
-        } = mapping
-        {
-            assert!(!entry.present());
-            entry.set(addr, flags);
-            Ok(())
-        } else {
-            Err(PagingError::AllocFrame)
-        }
+    pub fn unmap(&mut self, vaddr: VirtAddr) -> (Option<PageLevel>, MayNeedFlush<A::TlbFlushTok>) {
+        let mut m = self.walk_mut(vaddr);
+        (PTPage::<A, P>::do_unmap(m.staged()), m.commit())
     }
 
-    /// Unmaps a 4KB page.
-    ///
-    /// # Parameters
-    /// - `vaddr`: The virtual address of the mapping to unmap.
+    /// Sets the shared state for a 4KB page.
     ///
     /// # Returns
-    /// A copy of the [`PTEntry`] that mapped the virtual address together
-    /// with the [`MayNeedFlush`] TLB-flush obligation for the now-stale
-    /// translation, or [`None`] if no leaf was mapped.
-    pub fn unmap_4k(
+    /// A result with the TLB-flush obligation on success or a [`PagingError`].
+    pub fn set_shared_4k(
         &mut self,
         vaddr: VirtAddr,
-    ) -> (Option<PTEntry<A>>, MayNeedFlush<A::TlbFlushTok>) {
-        let mapping = self.walk_addr(vaddr);
-        let level = mapping.level;
+    ) -> Result<MayNeedFlush<A::TlbFlushTok>, PagingError> {
+        let mut m = self.walk_mut(vaddr);
+        PTPage::<A, P>::do_set_shared_4k(m.staged(), vaddr)?;
+        Ok(m.commit())
+    }
 
-        match mapping.level {
-            PageLevel::Level0 => {
-                let entry = *mapping.entry;
-                mapping.entry.clear();
-                (Some(entry), MayNeedFlush::new(vaddr, level))
-            }
-            _ => {
-                assert!(!mapping.entry.present());
-                (None, MayNeedFlush::none())
-            }
+    /// Sets the encryption state for a 4KB page.
+    ///
+    /// # Returns
+    /// A result with the TLB-flush obligation on success or a [`PagingError`].
+    pub fn set_encrypted_4k(
+        &mut self,
+        vaddr: VirtAddr,
+    ) -> Result<MayNeedFlush<A::TlbFlushTok>, PagingError> {
+        let mut m = self.walk_mut(vaddr);
+        PTPage::<A, P>::do_set_encrypted_4k(m.staged(), vaddr)?;
+        Ok(m.commit())
+    }
+
+    /// Populates the page table entry at the given index
+    /// TLB flush is not required since the caller assumes the old entry is
+    /// non-present or the table is not installed.
+    ///
+    /// # Parameters
+    /// - `idx`: The index within the page table to populate.
+    /// - `subpage_pa`: The physical address of the subpage to map.
+    ///
+    /// # Returns
+    /// `true` if the entry was updated, `false` if the entry already contained the desired mapping.
+    pub fn populate(&mut self, idx: usize, subpage_pa: PhysAddr) -> Result<bool, PagingError>
+    where
+        L: NextLevel,
+    {
+        let desired = PTEntry::new(
+            A::make_private_address(subpage_pa),
+            A::PTFlags::parent_flags(),
+        );
+        let page = self.root.as_mut_ptr();
+        let mut mapping = S::new_mapping_mut(None, L::TOP_LEVEL, page, idx);
+        let staged = mapping.staged().entry;
+        if staged.raw() == desired.raw() {
+            return Ok(false);
         }
+        mapping.commit_no_flush(|m| {
+            *m.entry = desired;
+            Ok(true)
+        })
     }
 
     /// Maps the half-open virtual range `[start, end)` using 4KB pages,
@@ -949,7 +824,10 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         phys: PhysAddr,
         flags: A::PTFlags,
         shared: bool,
-    ) -> Result<(), PagingError> {
+    ) -> Result<(), PagingError>
+    where
+        L: NextLevel,
+    {
         let mut vaddr = start;
         while vaddr < end {
             let offset = vaddr - start;
@@ -967,7 +845,10 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
         &mut self,
         start: VirtAddr,
         end: VirtAddr,
-    ) -> MayNeedFlush<A::TlbFlushTok> {
+    ) -> MayNeedFlush<A::TlbFlushTok>
+    where
+        L: NextLevel,
+    {
         let mut flush = MayNeedFlush::none();
         let mut vaddr = start;
         while vaddr < end {
@@ -1019,69 +900,253 @@ impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> GenericPageTable<A, P,
     /// # Returns
     /// 1. whether every page in the range was mapped (`true`) or not (`false`).
     /// 2. a [`MayNeedFlush`] indicating which TLB entries may need to be flushed.
-    ///
-    /// All mapped pages in the range are unmapped regardless.
+    ///    All mapped pages in the range are unmapped regardless.
     pub fn unmap_region(
         &mut self,
         start: VirtAddr,
         end: VirtAddr,
     ) -> (bool, MayNeedFlush<A::TlbFlushTok>) {
-        let mut vaddr = start;
-        let mut was_mapped = true;
         let mut flush = MayNeedFlush::none();
+        let mut vaddr = start;
+        let mut all_mapped = true;
         while vaddr < end {
-            let mapping = self.walk_addr(vaddr);
-            let local_flush = MayNeedFlush::new(vaddr, mapping.level);
-            match mapping.level {
-                PageLevel::Level0 => {
-                    mapping.entry.clear();
-                    vaddr = vaddr + PAGE_SIZE;
-                    flush = flush.and(local_flush);
-                }
-                level if mapping.entry.present() && mapping.entry.huge() => {
-                    mapping.entry.clear();
-                    vaddr = vaddr + level.size();
-                    flush = flush.and(local_flush);
-                }
+            let (level, f) = self.unmap(vaddr);
+            flush = flush.and(f);
+            vaddr = match level {
+                Some(l) => vaddr + l.size(),
                 _ => {
-                    was_mapped = false;
-                    vaddr = vaddr + PAGE_SIZE;
+                    all_mapped = false;
+                    vaddr + PAGE_SIZE
                 }
-            }
+            };
         }
-
-        (was_mapped, flush)
+        (all_mapped, flush)
     }
 
-    /// Retrieves the physical address of a mapping.
+    /// Returns `true` if no entry in `page` (holding `level` entries) is present.
+    fn page_is_empty(page: *const PTPage<A, P>, level: PageLevel) -> bool {
+        (0..ENTRY_COUNT).all(|idx| !S::new_mapping_ref(level, page, idx).read().present())
+    }
+
+    fn free_pt_after_unmap(
+        page: *mut PTPage<A, P>,
+        level: PageLevel,
+        start_vaddr: VirtAddr,
+        end_vaddr: VirtAddr,
+    ) -> bool {
+        // Leaf entry representing mapped frame which should not be freed here.
+        if level.next_down().is_none() {
+            return Self::page_is_empty(page, level);
+        }
+        let start = Self::index_at(start_vaddr, level);
+        let end = Self::index_at(end_vaddr, level);
+        let mut next_start_vaddr = start_vaddr;
+        let next_level = level.next_down().unwrap();
+        let next_end_vaddr = (next_start_vaddr + next_level.size()).align_down(next_level.size());
+        let mut next_end_vaddr = min(next_end_vaddr, end_vaddr);
+        for index in start..=end {
+            let mut mapping = S::new_mapping_mut(None, level, page, index);
+            let entry = mapping.read();
+            if let Some(next) = PTPage::<A, P>::from_entry_raw(&entry) {
+                if Self::free_pt_after_unmap(
+                    next,
+                    level.next_down().unwrap(),
+                    next_start_vaddr,
+                    next_end_vaddr,
+                ) {
+                    mapping.staged().entry.clear();
+                    // SAFETY: We do not need flush the TLB,
+                    // since the old leaf mappings were non-present.
+                    unsafe {
+                        mapping.commit().ignore();
+                    }
+                    // SAFETY: the PT page is not reachable and can be safely deallocated.
+                    unsafe {
+                        P::deallocate_physical_page(entry.address());
+                    }
+                }
+                next_start_vaddr = next_end_vaddr;
+                next_end_vaddr = min(next_end_vaddr + next_level.size(), end_vaddr);
+            }
+        }
+        Self::page_is_empty(page, level)
+    }
+
+    /// Frees the page table pages that are no longer reachable after unmapping
+    pub fn free_page_table_by_range(&mut self, start_vaddr: VirtAddr, end_vaddr: VirtAddr) {
+        Self::free_pt_after_unmap(
+            self.root.as_mut_ptr(),
+            PagingLevel3::TOP_LEVEL,
+            start_vaddr,
+            end_vaddr,
+        );
+    }
+}
+
+impl<A: ArchPagingMeta, P: PagingHandler + SelfMap, S: PageTableStateSealed<A, P>>
+    GenericPageTable<A, P, PagingLevel3, S>
+{
+    /// Install the self-map entry in a freshly zeroed page table.
+    ///
+    /// The self-map PML4 entry is written at [`SelfMap::SELFMAP_IDX`] and points
+    /// at this page table's own root page.
+    pub fn init_self_map(&mut self, root_pa: PhysAddr) {
+        let flags = A::PTFlags::self_map_table_flags();
+        let mapping = S::new_mapping_mut(
+            None,
+            PagingLevel3::TOP_LEVEL,
+            self.root.as_mut_ptr(),
+            P::SELFMAP_IDX,
+        );
+        mapping
+            .commit_no_flush(|m| {
+                m.entry.set(A::make_private_address(root_pa), flags);
+                Ok(())
+            })
+            .expect("fails to init self mapping");
+    }
+
+    const fn pte_base_vaddr() -> VirtAddr {
+        virt_from_lvl_idx(P::SELFMAP_IDX, PagingLevel3::TOP_LEVEL)
+    }
+
+    /// Calculate the virtual address of a PTE in the self-map, which maps a
+    /// specified virtual address.
     ///
     /// # Parameters
-    /// - `vaddr`: The virtual address to query.
+    /// - `vaddr': The virtual address whose PTE should be located.
     ///
     /// # Returns
-    /// The physical address of the mapping if present; otherwise, an error
-    /// ([`PagingError`]).
-    pub fn phys_addr(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, PagingError> {
-        let mapping = self.walk_addr(vaddr);
+    /// The virtual address of the PTE.
+    fn get_pte_address(vaddr: VirtAddr) -> VirtAddr {
+        Self::pte_base_vaddr() + ((usize::from(vaddr) & 0x0000_FFFF_FFFF_F000) >> PTE_SHIFT)
+    }
 
-        match mapping.level {
-            PageLevel::Level0 => {
-                let offset = vaddr.page_offset();
-                let entry = mapping.entry;
-                if !entry.present() {
-                    return Err(PagingError::NotMapped);
-                }
-                Ok(entry.address() + offset)
-            }
-            PageLevel::Level1 => {
-                let offset = vaddr.bits() & (PAGE_SIZE_2M - 1);
-                let entry = mapping.entry;
-                if !entry.present() || !entry.huge() {
-                    return Err(PagingError::NotMapped);
-                }
-                Ok(entry.address() + offset)
-            }
-            _ => Err(PagingError::NotMapped),
+    /// Perform a virtual to physical translation using the self-map.
+    ///
+    /// This reads page-table entries through the self mapping.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the a self-mapped page table is installed and
+    /// no concurrent update to the page table entries for the vaddr.
+    ///
+    /// Risk behinds the lockless translation:
+    /// 1. dangling pointer: a PTPage is already deallocated.
+    /// 3. Wrong translation: another thread remaps or modifies mapping.
+    ///
+    /// # Parameters
+    /// - `vaddr': The virtual address to translate.
+    ///
+    /// # Returns
+    /// Some(PageFrame) if the virtual address is valid.
+    /// None if the virtual address is not valid.
+    pub unsafe fn virt_to_frame(vaddr: VirtAddr) -> Option<PageFrame<A>> {
+        let pte_addr = Self::get_pte_address(vaddr);
+        let pde_addr = Self::get_pte_address(pte_addr);
+        let pdpe_addr = Self::get_pte_address(pde_addr);
+        let pml4e_addr = Self::get_pte_address(pdpe_addr);
+
+        // SAFETY: Check each entry in the paging hierarchy to ensure it is
+        // safe to read the next entry.
+        let pml4e = unsafe { PTEntry::<A>::read_pte(pml4e_addr.as_ptr()) };
+        if !pml4e.present() {
+            return None;
         }
+
+        // There is no need to check for a large page in the PML4E because
+        // the architecture does not support the large bit at the top-level
+        // entry.  If a large page is detected at a lower level of the
+        // hierarchy, the low bits from the virtual address must be combined
+        // with the physical address from the PDE/PDPE.
+
+        // SAFETY: The PML4E was checked to be present, so the PDPE exists
+        // and can be read safely.
+        let pdpe = unsafe { PTEntry::<A>::read_pte(pdpe_addr.as_ptr()) };
+        if !pdpe.present() {
+            return None;
+        }
+        if pdpe.huge() {
+            let pa = pdpe.page_frame() + (vaddr.bits() & (PAGE_SIZE_1G - 1));
+            return Some(PageFrame::Size1G(pa, PhantomData));
+        }
+
+        // SAFETY: The PDPE was checked to be present and not to be a huge
+        // page. So the PDE exists and can be read safely.
+        let pde = unsafe { PTEntry::<A>::read_pte(pde_addr.as_ptr()) };
+        if !pde.present() {
+            return None;
+        }
+        if pde.huge() {
+            let pa = pde.page_frame() + (vaddr.bits() & (PAGE_SIZE_2M - 1));
+            return Some(PageFrame::Size2M(pa));
+        }
+
+        // SAFETY: The PDE was checked to be present and not to be a huge
+        // page. So the PTE exists and can be read safely.
+        let pte = unsafe { PTEntry::<A>::read_pte(pte_addr.as_ptr()) };
+        if pte.present() {
+            let pa = pte.page_frame() + (vaddr.page_offset());
+            Some(PageFrame::Size4K(pa))
+        } else {
+            None
+        }
+    }
+}
+
+pub type InactivePageTable<A, P, L> = GenericPageTable<A, P, L, Inactive>;
+
+impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> InactivePageTable<A, P, L> {
+    /// Transition this table to the [`Installed`] state.
+    ///
+    /// Safe because [`Installed`] only ever accesses entries through volatile
+    /// operations, which is a sound superset of what an inactive table allows.
+    /// The actual `CR3` load is performed separately by OS-specific code.
+    pub fn install(self) -> InstalledPageTable<A, P, L> {
+        let root = self.root;
+        // Transfer ownership of the root page to the new handle without
+        // running `Drop` (which would free it) on the old one.
+        core::mem::forget(self);
+        InstalledPageTable {
+            root,
+            _level: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// The caller must guarantee that the page table's children are not in use and can be safely freed.
+    pub unsafe fn free_children(&mut self) {
+        // SAFETY: `self.root` is this inactive table's valid root page; the
+        // caller guarantees its children are not in use and can be safely
+        // freed.
+        unsafe { PTPage::<A, P>::from_vaddr(self.root).free_lvl(L::TOP_LEVEL) };
+    }
+}
+
+pub type InstalledPageTable<A, P, L> = GenericPageTable<A, P, L, Installed>;
+
+impl<A: ArchPagingMeta, P: PagingHandler, L: PagingLevel> InstalledPageTable<A, P, L> {
+    pub fn cr3_value(&self) -> PhysAddr {
+        self.root_pa()
+    }
+
+    /// Borrow the wrapped table as an inactive table.
+    ///
+    /// # Safety
+    /// The caller must guarantee the table is not installed, i.e. not
+    /// reachable by the MMU on any CPU, for the duration of the borrow.
+    /// Inactive access forms `&mut` references into the page table page.
+    pub unsafe fn as_inactive(&mut self) -> &mut InactivePageTable<A, P, L> {
+        // SAFETY: The caller guarantees that the table is not installed, so forming a `&mut` reference to an inactive table is sound.
+        unsafe { &mut *(self as *mut _ as *mut InactivePageTable<A, P, L>) }
+    }
+
+    /// Deallocates the root page of the page table.
+    ///
+    /// # Safety
+    /// The caller must guarantee that the page table is inactive and no longer in use.
+    pub unsafe fn dealloc(&mut self) {
+        // SAFETY: GenericPageTable owns the root page, `root` was allocated by `alloc()`.
+        unsafe { P::deallocate_physical_page(self.root_pa()) };
     }
 }

@@ -11,6 +11,7 @@
 
 pub mod address;
 pub mod pagetable;
+pub mod ptpage;
 pub mod sizes;
 pub mod tlb;
 pub mod traits;

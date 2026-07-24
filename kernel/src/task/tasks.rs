@@ -352,7 +352,7 @@ pub struct Task {
     pub shadow_stack_base: VirtAddr,
 
     /// Page table that is loaded when the task is scheduled
-    pub page_table: SpinLock<PageBox<PageTable>>,
+    pub page_table: SpinLock<PageTable>,
 
     /// Task kernel stack mapping
     _kernel_stack: TaskKernelMapping,
@@ -437,6 +437,11 @@ impl Drop for Task {
         // but they are good sanity checks on the scheduler.
         debug_assert!(self.is_terminated() || self.is_pending());
         debug_assert!(irqs_enabled());
+        // Deallocate the page table associated with this task since
+        // SAFETY: this is safe since the task is inactive.
+        unsafe {
+            self.page_table.lock().dealloc();
+        }
     }
 }
 
@@ -462,7 +467,7 @@ impl Task {
     fn create_common(cpu: &PerCpu, args: CreateTaskArguments) -> Result<TaskPointer, SvsmError> {
         let mut pgtable = cpu.get_pgtable().clone_shared()?;
 
-        cpu.populate_page_table(&mut pgtable).expect_no_flush();
+        cpu.populate_page_table(&mut pgtable);
 
         let (task_mm, objtree) = {
             if let Some(ref parent_thread) = args.thread_of {
@@ -534,10 +539,7 @@ impl Task {
         let kernel_stack_mapping = TaskKernelMapping::new(task_mm.clone(), stack)?;
         let stack_start = kernel_stack_mapping.virt_addr();
 
-        task_mm
-            .kernel_range()
-            .populate(&mut pgtable)
-            .expect_no_flush();
+        task_mm.kernel_range().populate(&mut pgtable);
 
         // Remap at the per-task offset
         let bounds = MemoryRegion::new(stack_start + raw_bounds.start().into(), raw_bounds.len());
@@ -554,7 +556,7 @@ impl Task {
             xsa,
             stack_bounds: bounds,
             shadow_stack_base,
-            page_table: SpinLock::new(pgtable),
+            page_table: SpinLock::new(pgtable.into()),
             _kernel_stack: kernel_stack_mapping,
             _shadow_stack: shadow_stack_mapping,
             mm: task_mm,

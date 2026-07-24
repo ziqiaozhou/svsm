@@ -7,7 +7,9 @@
 use crate::address::{Address, VirtAddr};
 use crate::error::SvsmError;
 use crate::locking::RWLock;
-use crate::mm::pagetable::{PTEntryFlags, PageTable, PageTablePart, SvsmMayNeedFlush};
+use crate::mm::pagetable::{
+    PTEntryFlags, PageTable, PageTablePart, PopulatePagePart, SvsmMayNeedFlush,
+};
 use crate::mm::virt_from_idx;
 use crate::types::{PAGE_SHIFT, PAGE_SIZE, PageSize};
 use crate::utils::{MemoryRegion, align_down, align_up};
@@ -116,7 +118,7 @@ impl VMR {
         for idx in 0..count {
             let mut part = PageTablePart::new(start + (idx * VMR_GRANULE));
             if !lazy {
-                part.alloc();
+                part.alloc()?;
             }
             vec.push(part);
         }
@@ -129,14 +131,12 @@ impl VMR {
     /// # Arguments
     ///
     /// * `pgtbl` - A [`PageTable`] pointing to the target page-table
-    pub fn populate(&self, pgtbl: &mut PageTable) -> SvsmMayNeedFlush {
+    pub fn populate(&self, pgtbl: &mut impl PopulatePagePart) {
         let parts = self.pgtbl_parts.lock_read();
-        let mut need_flush = SvsmMayNeedFlush::none();
+
         for part in parts.iter() {
-            let (_, flush) = pgtbl.populate_pgtbl_part(part);
-            need_flush = flush.and(need_flush);
+            pgtbl.populate_pgtbl_part(part);
         }
-        need_flush
     }
 
     fn populate_addr(&self, pgtbl: &mut PageTable, vaddr: VirtAddr) -> Result<(), SvsmError> {
@@ -147,9 +147,7 @@ impl VMR {
 
         let idx = vaddr.to_pgtbl_idx::<3>() - vregion.start().to_pgtbl_idx::<3>();
         let parts = self.pgtbl_parts.lock_read();
-        let (updated, flush) = pgtbl.populate_pgtbl_part(&parts[idx]);
-        flush.expect_no_flush();
-        if !updated {
+        if !pgtbl.populate_pgtbl_part(&parts[idx]) {
             return Err(SvsmError::Mem);
         }
         Ok(())
