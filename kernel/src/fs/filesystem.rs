@@ -17,26 +17,43 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-/// Represents a raw file handle.
+/// Represents a handle used for file operations in a thread-safe manner.
 #[derive(Debug)]
-struct RawFileHandle {
+pub struct FileHandle {
     file: Arc<dyn File>,
-    /// current file offset for the read/write operation
-    current: usize,
+    /// Current file offset for read/write operations. Use a spinlock
+    /// to serialize updates when reading or writing using this handle.
+    /// Synchronized access to the file itself from other handles is
+    /// handled by the File trait itself, as it is Sync and its methods
+    /// take `&self`.
+    current: SpinLock<usize>,
     /// True when file is open for reading
     read: bool,
     /// True when file is open for writing
     write: bool,
 }
 
-impl RawFileHandle {
-    fn new(file: &Arc<dyn File>, read: bool, write: bool) -> Self {
+impl FileHandle {
+    /// Create a new file handle instance.
+    pub fn new(file: &Arc<dyn File>, read: bool, write: bool) -> Self {
         Self {
             file: file.clone(),
-            current: 0,
+            current: SpinLock::new(0),
             read,
             write,
         }
+    }
+
+    /// Check whether FileHandle is open for reading.
+    #[inline]
+    pub fn readable(&self) -> bool {
+        self.read
+    }
+
+    /// Check whether FileHandle is open for writing.
+    #[inline]
+    pub fn writable(&self) -> bool {
+        self.write
     }
 
     fn check_read(&self) -> Result<(), SvsmError> {
@@ -55,102 +72,6 @@ impl RawFileHandle {
         }
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, SvsmError> {
-        self.check_read()?;
-        let result = self.file.read(buf, self.current);
-        if let Ok(v) = result {
-            self.current += v;
-        }
-        result
-    }
-
-    fn read_buffer(&mut self, buffer: &mut dyn Buffer) -> Result<usize, SvsmError> {
-        self.check_read()?;
-        let result = self.file.read_buffer(buffer, self.current);
-        if let Ok(bytes) = result {
-            self.current += bytes;
-        }
-        result
-    }
-
-    fn write(&mut self, buf: &[u8]) -> Result<usize, SvsmError> {
-        self.check_write()?;
-        let result = self.file.write(buf, self.current);
-        if let Ok(num) = result {
-            self.current += num;
-        }
-        result
-    }
-
-    fn write_buffer(&mut self, buffer: &dyn Buffer) -> Result<usize, SvsmError> {
-        self.check_write()?;
-        let result = self.file.write_buffer(buffer, self.current);
-        if let Ok(bytes) = result {
-            self.current += bytes;
-        }
-        result
-    }
-
-    fn truncate(&mut self, offset: usize) -> Result<usize, SvsmError> {
-        self.check_write()?;
-        let result = self.file.truncate(offset);
-        let new_size = self.file.size();
-        if result.is_ok() && self.current >= new_size {
-            self.current = new_size;
-        }
-        result
-    }
-
-    fn seek_abs(&mut self, pos: usize) {
-        self.current = min(pos, self.file.size());
-    }
-
-    fn seek_rel(&mut self, offset: isize) {
-        let pos = self.current.checked_add_signed(offset).unwrap_or(0);
-        self.seek_abs(pos);
-    }
-
-    fn seek_end(&mut self, offset: usize) {
-        let pos = self.file.size().saturating_sub(offset);
-        self.seek_abs(pos);
-    }
-
-    fn size(&self) -> usize {
-        self.file.size()
-    }
-
-    fn mapping(&self, offset: usize) -> Option<PageRef> {
-        self.file.mapping(offset)
-    }
-}
-
-/// Represents a handle used for file operations in a thread-safe manner.
-#[derive(Debug)]
-pub struct FileHandle {
-    // Use a SpinLock here because the read operation also needs to be mutable
-    // (changes file pointer). Parallel reads are still possible with multiple
-    // file handles
-    handle: SpinLock<RawFileHandle>,
-}
-
-impl FileHandle {
-    /// Create a new file handle instance.
-    pub fn new(file: &Arc<dyn File>, read: bool, write: bool) -> Self {
-        FileHandle {
-            handle: SpinLock::new(RawFileHandle::new(file, read, write)),
-        }
-    }
-
-    /// Check whether FileHandle is open for reading.
-    pub fn readable(&self) -> bool {
-        self.handle.lock().check_read().is_ok()
-    }
-
-    /// Check whether FileHandle is open for writing.
-    pub fn writable(&self) -> bool {
-        self.handle.lock().check_write().is_ok()
-    }
-
     /// Used to read contents from the file handle.
     ///
     /// # Arguments
@@ -163,7 +84,13 @@ impl FileHandle {
     /// bytes read if successful, or an [`SvsmError`] if there was a problem
     /// during the read operation.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, SvsmError> {
-        self.handle.lock().read(buf)
+        self.check_read()?;
+        let mut current = self.current.lock();
+        let result = self.file.read(buf, *current);
+        if let Ok(v) = result {
+            *current += v;
+        }
+        result
     }
 
     /// Read contents from the file to a [`Buffer`].
@@ -178,7 +105,13 @@ impl FileHandle {
     /// bytes read if successful, or an [`SvsmError`] if there was a problem
     /// during the read operation.
     pub fn read_buffer(&self, buffer: &mut dyn Buffer) -> Result<usize, SvsmError> {
-        self.handle.lock().read_buffer(buffer)
+        self.check_read()?;
+        let mut current = self.current.lock();
+        let result = self.file.read_buffer(buffer, *current);
+        if let Ok(bytes) = result {
+            *current += bytes;
+        }
+        result
     }
 
     /// Used to write contents to the file handle
@@ -193,7 +126,13 @@ impl FileHandle {
     /// bytes written if successful, or an [`SvsmError`] if there was a problem
     /// during the write operation.
     pub fn write(&self, buf: &[u8]) -> Result<usize, SvsmError> {
-        self.handle.lock().write(buf)
+        self.check_write()?;
+        let mut current = self.current.lock();
+        let result = self.file.write(buf, *current);
+        if let Ok(num) = result {
+            *current += num;
+        }
+        result
     }
 
     /// Write data to the file via a [`Buffer`].
@@ -208,7 +147,13 @@ impl FileHandle {
     /// bytes written if successful, or an [`SvsmError`] if the operation
     /// failed.
     pub fn write_buffer(&self, buffer: &dyn Buffer) -> Result<usize, SvsmError> {
-        self.handle.lock().write_buffer(buffer)
+        self.check_write()?;
+        let mut current = self.current.lock();
+        let result = self.file.write_buffer(buffer, *current);
+        if let Ok(bytes) = result {
+            *current += bytes;
+        }
+        result
     }
 
     /// Used to truncate the file to the specified size.
@@ -224,7 +169,17 @@ impl FileHandle {
     /// file after truncation if successful, or an [`SvsmError`] if there was
     /// a problem during the truncate operation.
     pub fn truncate(&self, offset: usize) -> Result<usize, SvsmError> {
-        self.handle.lock().truncate(offset)
+        self.check_write()?;
+        let mut current = self.current.lock();
+        let result = self.file.truncate(offset);
+        if let Ok(new_size) = result {
+            *current = current.min(new_size);
+        }
+        result
+    }
+
+    fn seek_abs_locked(&self, current: &mut usize, pos: usize) {
+        *current = min(pos, self.file.size())
     }
 
     /// Change the current file offset to an absolute position.
@@ -233,7 +188,8 @@ impl FileHandle {
     ///
     /// - `pos`: intended new file offset value.
     pub fn seek_abs(&self, pos: usize) {
-        self.handle.lock().seek_abs(pos);
+        let mut current = self.current.lock();
+        self.seek_abs_locked(&mut current, pos)
     }
 
     /// Change the current file offset relative to the current position.
@@ -242,7 +198,9 @@ impl FileHandle {
     ///
     /// - `offset`: Signed value to add to current file position.
     pub fn seek_rel(&self, offset: isize) {
-        self.handle.lock().seek_rel(offset);
+        let mut current = self.current.lock();
+        let pos = current.checked_add_signed(offset).unwrap_or(0);
+        self.seek_abs_locked(&mut current, pos);
     }
 
     /// Set the current file offset relative to the end of file.
@@ -251,7 +209,9 @@ impl FileHandle {
     ///
     /// - `offset`: Value to subtract from end-of-file position.
     pub fn seek_end(&self, offset: usize) {
-        self.handle.lock().seek_end(offset);
+        let mut current = self.current.lock();
+        let pos = self.file.size().saturating_sub(offset);
+        *current = pos;
     }
 
     /// Used to get the size of the file.
@@ -260,15 +220,15 @@ impl FileHandle {
     ///
     /// Size of the file in bytes.
     pub fn size(&self) -> usize {
-        self.handle.lock().size()
+        self.file.size()
     }
 
     pub fn position(&self) -> usize {
-        self.handle.lock().current
+        *self.current.lock()
     }
 
     pub fn mapping(&self, offset: usize) -> Option<PageRef> {
-        self.handle.lock().mapping(offset)
+        self.file.mapping(offset)
     }
 }
 
@@ -415,8 +375,7 @@ where
     let mut current_dir = dir;
 
     for item in path_items {
-        let dir_name = FileName::from(item);
-        let dir_entry = current_dir.lookup_entry(&dir_name)?;
+        let dir_entry = current_dir.lookup_entry(item)?;
         current_dir = match dir_entry {
             DirEntry::File(_) => return Err(SvsmError::FileSystem(FsError::file_not_found())),
             DirEntry::Directory(dir) => dir,
@@ -507,10 +466,10 @@ pub fn open_root(
     write: bool,
 ) -> Result<FileHandle, SvsmError> {
     let mut path_items = split_path(path)?;
-    let file_name = FileName::from(path_items.next_back().unwrap());
+    let file_name = path_items.next_back().unwrap();
     let current_dir = walk_path(root_dir, path_items)?;
 
-    let dir_entry = current_dir.lookup_entry(&file_name)?;
+    let dir_entry = current_dir.lookup_entry(file_name)?;
 
     match dir_entry {
         DirEntry::Directory(_) => Err(SvsmError::FileSystem(FsError::file_not_found())),
@@ -713,11 +672,11 @@ pub fn mkdir(path: &str) -> Result<(), SvsmError> {
 /// value if successful,  [`SvsmError`] otherwise.
 pub fn unlink_root(root_dir: Arc<dyn Directory>, path: &str) -> Result<(), SvsmError> {
     let mut path_items = split_path(path)?;
-    let entry_name = FileName::from(path_items.next_back().unwrap());
+    let entry_name = path_items.next_back().unwrap();
     let dir = walk_path(root_dir, path_items)?;
 
-    match dir.lookup_entry(&entry_name)? {
-        DirEntry::File(_) => dir.unlink(&entry_name),
+    match dir.lookup_entry(entry_name)? {
+        DirEntry::File(_) => dir.unlink(entry_name),
         DirEntry::Directory(_) => Err(SvsmError::FileSystem(FsError::is_dir())),
     }
 }
@@ -754,14 +713,14 @@ pub fn unlink(path: &str) -> Result<(), SvsmError> {
 /// in progress.
 pub fn rmdir_root(root_dir: Arc<dyn Directory>, path: &str) -> Result<(), SvsmError> {
     let mut path_items = split_path(path)?;
-    let entry_name = FileName::from(path_items.next_back().unwrap());
+    let entry_name = path_items.next_back().unwrap();
     let dir = walk_path(root_dir, path_items)?;
 
-    match dir.lookup_entry(&entry_name)? {
+    match dir.lookup_entry(entry_name)? {
         DirEntry::File(_) => Err(SvsmError::FileSystem(FsError::is_file())),
         DirEntry::Directory(target) => {
             target.prepare_remove()?;
-            dir.unlink(&entry_name)
+            dir.unlink(entry_name)
         }
     }
 }
@@ -931,7 +890,7 @@ mod tests {
 
         // Check if it appears in the listing
         let root_list = list_dir("").unwrap();
-        assert!(root_list.contains(&FileName::from("test1")));
+        assert!(root_list.iter().any(|f| f == "test1"));
 
         // Try again - should succeed now
         create("test1/file1").unwrap();
@@ -950,7 +909,7 @@ mod tests {
 
         // Check if it appears in the listing
         let root_list = list_dir("").unwrap();
-        assert!(root_list.contains(&FileName::from("test1")));
+        assert!(root_list.iter().any(|f| f == "test1"));
 
         // Try creating again as file - should fail
         create("test1").unwrap_err();
@@ -966,8 +925,8 @@ mod tests {
 
         // Check if it is removed from the listing
         let root_list = list_dir("").unwrap();
-        assert!(!root_list.contains(&FileName::from("test1")));
-        assert!(root_list.contains(&FileName::from("test2")));
+        assert!(!root_list.iter().any(|f| f == "test1"));
+        assert!(root_list.iter().any(|f| f == "test2"));
 
         // Cleanup
         rmdir("test2").unwrap();
@@ -989,14 +948,14 @@ mod tests {
 
         // Check if it appears in the listing
         let list = list_dir("test1/").unwrap();
-        assert_eq!(list, [FileName::from("test2")]);
+        assert_eq!(list, ["test2"]);
 
         // Try again - should succeed now
         create("test1/test2/file1").unwrap();
 
         // Check if it appears in the listing
         let list = list_dir("test1/test2/").unwrap();
-        assert_eq!(list, [FileName::from("file1")]);
+        assert_eq!(list, ["file1"]);
 
         // Cleanup
         unlink("test1/test2/file1").unwrap();
@@ -1018,7 +977,7 @@ mod tests {
 
         // Check if they appears in the listing
         let list = list_dir("test1").unwrap();
-        assert_eq!(list, [FileName::from("file1"), FileName::from("file2")]);
+        assert_eq!(list, ["file1", "file2"]);
 
         // Unlink non-existent file
         unlink("test2").unwrap_err();
@@ -1028,7 +987,7 @@ mod tests {
 
         // Check if it is removed from the listing
         let list = list_dir("test1").unwrap();
-        assert_eq!(list, [FileName::from("file2")]);
+        assert_eq!(list, ["file2"]);
 
         // Cleanup
         unlink("test1/file2").unwrap();

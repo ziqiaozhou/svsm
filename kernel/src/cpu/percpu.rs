@@ -32,7 +32,7 @@ use crate::locking::{
     WriteLockGuard, WriteLockGuardIrqSafe,
 };
 use crate::mm::page_visibility::SharedBox;
-use crate::mm::pagetable::{PTEntryFlags, PageTable};
+use crate::mm::pagetable::{PTEntryFlags, PageTable, SvsmMayNeedFlush};
 use crate::mm::virtualrange::VirtualRange;
 use crate::mm::vm::{Mapping, VMKernelStack, VMPhysMem, VMR, VMRMapping, VMReserved};
 use crate::mm::{
@@ -61,7 +61,6 @@ use crate::types::{
 use crate::utils::MemoryRegion;
 use crate::utils::immut_after_init::ImmutAfterInitCell;
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -819,7 +818,7 @@ impl PerCpu {
 
     fn finish_page_table(&self) {
         let pgtable = self.get_pgtable();
-        self.vm_range.populate(pgtable);
+        self.vm_range.populate(pgtable).expect_no_flush();
     }
 
     pub fn dump_vm_ranges(&self) {
@@ -886,7 +885,7 @@ impl PerCpu {
     }
 
     fn setup_idle_task_internal(&self, start_info: KernelThreadStartInfo) -> Result<(), SvsmError> {
-        let idle_task = Task::create(self, start_info, String::from("idle"))?;
+        let idle_task = Task::create(self, start_info, Arc::from("idle"))?;
         self.runqueue_mut().set_idle_task(idle_task);
         Ok(())
     }
@@ -1200,8 +1199,8 @@ impl PerCpu {
     /// # Arguments
     ///
     /// * `pt` - The page table to populate the the PerCpu range into
-    pub fn populate_page_table(&self, pt: &mut PageTable) {
-        self.vm_range.populate(pt);
+    pub fn populate_page_table(&self, pt: &mut PageTable) -> SvsmMayNeedFlush {
+        self.vm_range.populate(pt)
     }
 
     pub fn handle_pf(&self, vaddr: VirtAddr, write: bool) -> Result<(), SvsmError> {
