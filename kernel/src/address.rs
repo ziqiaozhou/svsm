@@ -109,6 +109,7 @@ pub trait Address: Copy + From<InnerAddr> + Into<InnerAddr> + Ord {
     }
 
     #[inline]
+    #[verus_verify(spinoff_prover)]
     #[verus_spec(ret =>
         requires
             align_requires(align),
