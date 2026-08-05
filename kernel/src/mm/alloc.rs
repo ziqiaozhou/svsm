@@ -730,7 +730,7 @@ impl HeapMemoryRegion {
         (self.start_virt <= vaddr && (vaddr - self.start_virt) < self.page_count * PAGE_SIZE).then(
             #[cfg_attr(verus_keep_ghost_body, verus_spec(ret: usize =>
                 requires
-                    vaddr.offset() > self.start_virt.offset()
+                    vaddr.offset() >= self.start_virt.offset()
                 ensures
                     ret == vaddr.offset() - self.start_virt.offset()
             ))]
