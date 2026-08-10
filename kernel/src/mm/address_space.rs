@@ -9,7 +9,7 @@ use crate::mm::pagetable::{PageFrame, PageTable};
 use crate::utils::immut_after_init::ImmutAfterInitCell;
 
 use verus_stub::*;
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 include!("address_space.verus.rs");
 
 #[verus_verify]

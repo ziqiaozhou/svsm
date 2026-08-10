@@ -56,7 +56,7 @@ This repository integrates formal verification using **Verus**.
 * Verified source files end with `*.verus.rs` or `*.proof.verus.rs` (e.g.,
   `address.verus.rs`, `alloc_perms.verus.rs`).
 * Verification Invariants: Never bypass, alter, or strip
-  `#![cfg_attr(verus_keep_ghost, ...)]` blocks or Verus ghost specifications
+  `#![cfg_attr(verus_only, ...)]` blocks or Verus ghost specifications
   unless specifically instructed. Any structural change to a verified module
   requires re-verification by executing the Verus toolchain.
 * If a compiler flag or configuration change is made, ensure the `verus` or

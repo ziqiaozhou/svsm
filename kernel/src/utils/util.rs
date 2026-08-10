@@ -10,7 +10,7 @@ use core::ops::{Add, BitAnd, Not, Sub};
 
 use verus_stub::*;
 
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 include!("util.verus.rs");
 
 #[verus_spec(ret =>

@@ -17,7 +17,7 @@ use verus_stub::*;
 
 use zerocopy::FromBytes;
 
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 include!("address.verus.rs");
 
 // The backing type to represent an address;

@@ -586,7 +586,7 @@ impl HeapMemoryRegion {
  * Thus, instead of define a new proof function, we define inline proofs.
  * TODO(verus): support real inline proof functions instead of using macros.
  */
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! grant_info_write {
     ($mr: ident, $perm: ident => $mem: ident, $reserved: ident, $id: ident) => {
         proof_decl! {
@@ -599,7 +599,7 @@ macro_rules! grant_info_write {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! revoke_info_write {
     ($mr: ident, $pfn: ident, $order: ident, $mem: ident, $reserved: ident, $id: ident => $p: ident) => {
         proof_decl!{
@@ -609,7 +609,7 @@ macro_rules! revoke_info_write {
     }
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_free_page_pre {
     ($mr: ident, $perm: ident, $pfn: ident => $mem: ident, $reserved: ident, $head_info: ident, $id: ident) => {
         proof_decl! {
@@ -619,7 +619,7 @@ macro_rules! lemma_free_page_pre {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_free_page_post {
     ($mr: ident, $pfn: ident, $order: ident, $mem: ident, $reserved: ident, $head_info: ident, $id: ident) => {
         proof_decl! {
@@ -630,7 +630,7 @@ macro_rules! lemma_free_page_post {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_split_pre {
     ($mr: ident, $perm: ident, $pfn1: ident, $pfn2: ident, $order: ident, $new_order: ident => $mem: ident, $mem2: ident, $reserved: ident, $reserved2: ident, $info: ident, $id: ident) => {
         proof_decl!{
@@ -652,7 +652,7 @@ macro_rules! lemma_split_pre {
     }
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_split_post {
     ($mr: ident, $pfn1: ident, $pfn2: ident, $new_order: ident, $mem: ident, $mem2: ident, $reserved: ident, $reserved2: ident, $id: ident, $p1: ident) => {
         proof_decl! {
@@ -669,7 +669,7 @@ macro_rules! lemma_split_post {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_merge_pre {
     ($mr: ident, $perm: ident, $p2: ident, $pfn1: ident, $pfn2: ident, $pfn: ident, $order: ident, $new_order: ident => $mem: ident, $reserved: ident, $head_info: ident, $id: ident) => {
         proof_decl! {
@@ -703,7 +703,7 @@ macro_rules! lemma_merge_pre {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_merge_post {
     ($mr: ident, $perm: ident, $pfn: ident, $order: ident, $new_order: ident, $mem: ident, $reserved: ident, $head_info: ident, $id: ident) => {
         proof_decl! {
@@ -721,7 +721,7 @@ macro_rules! lemma_merge_post {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_alloc_pfn_loop_pre {
     ($mr: ident, $perm: ident, $old_pfn: ident, $current_pfn: ident, $order: ident, $idx_: ident =>
         $prev_mem: ident,  $prev_id: ident, $prev_reserved: ident, $prev_head_info:ident,
@@ -741,7 +741,7 @@ macro_rules! lemma_alloc_pfn_loop_pre {
     }
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_alloc_pfn_loop_post {
     ($mr: ident, $perm: ident, $old_pfn: ident, $current_pfn: ident, $order: ident, $idx_: ident, $prev_mem: ident, $prev_info_id: ident,
         $prev_reserved: ident, $prev_head_info: ident, $mem: ident, $info_id: ident, $reserved: ident,
@@ -768,7 +768,7 @@ macro_rules! lemma_alloc_pfn_loop_post {
     }
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_free_page {
     ($mr: ident, $inperm: ident, $pfn: ident, $res: ident => $perm: ident) => {
         proof_decl! {
@@ -789,7 +789,7 @@ macro_rules! lemma_free_page {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_get_pfn {
     ($mr: ident, $vaddr: ident) => {
         proof! {
@@ -802,7 +802,7 @@ macro_rules! lemma_get_pfn {
     }
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_alloc_pages_info_pre {
     ($self: ident, $pfn: ident, $perm: ident => $mem: ident, $info: ident, $reserved: ident, $info_head: ident) => {
         proof_decl! {
@@ -815,7 +815,7 @@ macro_rules! lemma_alloc_pages_info_pre {
     };
 }
 
-#[cfg(verus_keep_ghost_body)]
+#[cfg_attr(verus_only, allow(unused))]
 macro_rules! lemma_alloc_pages_info_post {
     ($self: ident, $order: ident, $pfn: ident, $mem: ident, $info: ident, $reserved: ident, $info_head: ident, $ret_perm: ident) => {
         proof!{

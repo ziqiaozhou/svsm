@@ -11,15 +11,15 @@
 use verus_builtin_macros::*;
 
 pub mod bits;
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 pub mod frac_perm;
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 pub mod frac_ptr;
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 pub mod nonlinear;
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 pub mod set;
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 pub mod sum;
 
 verus! {

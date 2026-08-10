@@ -8,7 +8,7 @@ use vstd::raw_ptr::*;
 
 macro_rules! pointer_specs {
     ($mod_ident:ident, $ptr_from_data:ident, $mu:tt) => {
-        #[cfg(verus_keep_ghost)]
+        #[cfg(verus_only)]
         mod $mod_ident {
             use super::*;
 

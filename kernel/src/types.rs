@@ -8,7 +8,7 @@ use crate::error::SvsmError;
 use crate::sev::vmsa::VMPL_MAX;
 
 use verus_stub::*;
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 include!("types.verus.rs");
 
 verus! {

@@ -12,10 +12,10 @@
     test_runner(crate::testing::svsm_kernel_test_runner),
     reexport_test_harness_main = "kernel_tests_in_svsm"
 )]
-#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene))]
-#![cfg_attr(verus_keep_ghost, verifier::allow(unknown_automatic_derive))]
+#![cfg_attr(verus_only, feature(proc_macro_hygiene))]
+#![cfg_attr(verus_only, verifier::allow(unknown_automatic_derive))]
 #![cfg_attr(
-    verus_keep_ghost,
+    verus_only,
     allow(macro_expanded_macro_exports_accessed_by_absolute_paths)
 )]
 

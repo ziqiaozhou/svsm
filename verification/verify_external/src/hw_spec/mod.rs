@@ -3,5 +3,5 @@
 // Copyright (c) Microsoft Corporation
 //
 // Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
-#[cfg(verus_keep_ghost)]
+#[cfg(verus_only)]
 include!("mm.verus.rs");

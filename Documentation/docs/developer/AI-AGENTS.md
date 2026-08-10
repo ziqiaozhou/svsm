@@ -43,7 +43,7 @@ or removed.
 
 6. Verus section: *.verus.rs / *.proof.verus.rs files still exist,
 the verus / verus_all features are still defined in Cargo.toml, and
-cfg_attr(verus_keep_ghost, ...) is still the gating attribute in use.
+cfg_attr(verus_only, ...) is still the gating attribute in use.
 
 7. Spec references: the AMD/Intel publication numbers and titles in the
 "Reference Specifications" sections are the latest the project tracks (check
