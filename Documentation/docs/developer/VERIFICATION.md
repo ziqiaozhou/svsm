@@ -130,6 +130,11 @@ and to write specification and proofs in ghost mode.
 
 ### Annotation in Executable Rust
 
+* `#[cfg(verus_only)]`: Indicates that the code is being compiled with Verus for
+  verification. We use it to include specification and proof code that is only
+  needed during verification. It is also be used to apply attribute procedural
+  macros (e.g., #[verus_spec]) to a code block that are only permitted when the
+  `proc_macro_hygiene` feature is enabled by `verus_only`.
 * `#[verus_verify]`: Indicates the item is Verus-aware.
 * `#[verus_verify(external_body)]`: Indicates the item is Verus-aware, but marks the function body as uninterpreted by the verifier.
 * `#[verus_verify(external)]`: Instructs Verus to ignore the item. By default, items are treated as #[verus_verify(external)].
