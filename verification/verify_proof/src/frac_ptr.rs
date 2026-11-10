@@ -119,7 +119,7 @@ tokenized_state_machine!(addr_unique {
 );
 
 // A single inst + addr_unique::addr_to, addr_unique::to_addr are created at entry.
-pub struct UniqueByPtr {
+pub tracked struct UniqueByPtr {
     tracked inst: addr_unique::Instance,
     tracked id: addr_unique::ptr_readers,
     ghost addr_id_map: Option<(addr_unique::addr_to, addr_unique::to_addr)>,
